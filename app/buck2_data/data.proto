@@ -1477,6 +1477,8 @@ message CleanStaleStats {
   uint64 total_duration_s = 10;
   uint64 scan_duration_s = 11;
   uint64 clean_duration_s = 12;
+  uint64 stale_persistent_action_reuse_entry_count = 13;
+  uint64 cleaned_persistent_action_reuse_entry_count = 14;
 }
 
 enum CleanStaleResultKind {

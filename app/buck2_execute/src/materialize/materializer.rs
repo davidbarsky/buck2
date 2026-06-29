@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_common::cas_digest::CasDigestData;
 use buck2_common::file_ops::metadata::FileMetadata;
+use buck2_common::file_ops::metadata::TrackedFileDigest;
+use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -23,6 +26,8 @@ use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::ordered_entry_walk;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
@@ -31,12 +36,15 @@ use dice::UserComputationData;
 use dupe::Dupe;
 use futures::stream::BoxStream;
 use futures::stream::TryStreamExt;
+use sorted_vector_map::SortedVectorMap;
 
 use crate::artifact_value::ArtifactValue;
+use crate::artifact_value::ArtifactValueFingerprint;
 use crate::directory::ActionDirectoryEntry;
 use crate::directory::ActionDirectoryMember;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ActionSharedDirectory;
+use crate::execute::action_digest::ActionDigest;
 use crate::execute::action_digest::TrackedActionDigest;
 use crate::materialize::http::Checksum;
 
@@ -142,6 +150,125 @@ pub struct DeclareArtifactPayload {
     pub artifact: ArtifactValue,
     /// For content-based artifacts, the configuration-based path used for eager materialization lookups.
     pub configuration_path: Option<ProjectRelativePathBuf>,
+}
+
+/// Identifies the lookup entries produced by one execution so paired entries can be committed
+/// atomically.
+#[derive(Clone)]
+pub enum ActionReuseWrite {
+    IdenticalAction {
+        key: IdenticalActionReuseKey,
+        outputs: ActionReuseOutputs,
+    },
+    DepFile {
+        dep_file: DepFileActionReuseWrite,
+        outputs: ActionReuseOutputs,
+    },
+    IdenticalActionAndDepFile {
+        identical_action: IdenticalActionReuseKey,
+        dep_file: DepFileActionReuseWrite,
+        outputs: ActionReuseOutputs,
+    },
+}
+
+/// Couples filtered inputs to dep-file keys so identical-action entries cannot acquire
+/// dep-file-only state.
+#[derive(Clone)]
+pub struct DepFileActionReuseWrite {
+    pub key: DepFileActionReuseKey,
+    pub filtered_inputs: ActionReuseFilteredInputs,
+}
+
+#[derive(Clone, Dupe, Eq, PartialEq)]
+pub struct IdenticalActionReuseKey {
+    pub action_digest: ActionDigest,
+    pub local_reuse_key: CasDigestData,
+}
+
+#[derive(Clone, Dupe, Eq, PartialEq)]
+pub struct DepFileActionReuseKey {
+    pub common_digest: CasDigestData,
+    pub declared_dep_files_digest: CasDigestData,
+    pub execution_platform_digest: CasDigestData,
+    pub local_reuse_key: CasDigestData,
+}
+
+#[derive(Clone, Dupe, Eq, PartialEq)]
+pub enum ActionReuseKey {
+    IdenticalAction(IdenticalActionReuseKey),
+    DepFile(DepFileActionReuseKey),
+}
+
+impl From<IdenticalActionReuseKey> for ActionReuseKey {
+    fn from(key: IdenticalActionReuseKey) -> Self {
+        Self::IdenticalAction(key)
+    }
+}
+
+impl From<DepFileActionReuseKey> for ActionReuseKey {
+    fn from(key: DepFileActionReuseKey) -> Self {
+        Self::DepFile(key)
+    }
+}
+
+/// Keeps dep-file metadata out of identical-action lookup results.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepFileActionReuseData {
+    pub outputs: ActionReuseOutputs,
+    pub filtered_inputs: ActionReuseFilteredInputs,
+}
+
+/// References canonical materializer state without duplicating artifact values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionReuseOutputs(Vec<ActionReuseOutput>);
+
+impl ActionReuseOutputs {
+    pub fn new(mut outputs: Vec<ActionReuseOutput>) -> buck2_error::Result<Self> {
+        if outputs.is_empty() {
+            return Err(buck2_error::internal_error!(
+                "Action reuse entry has no outputs"
+            ));
+        }
+        outputs.sort_by(|left, right| left.output_path.cmp(&right.output_path));
+        if outputs
+            .windows(2)
+            .any(|outputs| outputs[0].output_path == outputs[1].output_path)
+        {
+            return Err(buck2_error::internal_error!(
+                "Action reuse entry has duplicate logical output paths"
+            ));
+        }
+        Ok(Self(outputs))
+    }
+
+    pub fn get(&self, path: &ForwardRelativePath) -> Option<&ActionReuseOutput> {
+        self.0
+            .binary_search_by(|output| output.output_path.as_str().cmp(path.as_str()))
+            .ok()
+            .map(|index| &self.0[index])
+    }
+}
+
+impl<'a> IntoIterator for &'a ActionReuseOutputs {
+    type Item = &'a ActionReuseOutput;
+    type IntoIter = std::slice::Iter<'a, ActionReuseOutput>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionReuseOutput {
+    pub output_path: ForwardRelativePathBuf,
+    pub content_based_path_hash: ContentBasedPathHash,
+    pub artifact_value_fingerprint: ArtifactValueFingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionReuseFilteredInputs {
+    pub untagged: TrackedFileDigest,
+    pub tagged: SortedVectorMap<String, TrackedFileDigest>,
 }
 
 /// A trait providing methods to asynchronously materialize artifacts.
@@ -309,7 +436,7 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
     /// time.
     fn add_snapshot_stats(&self, _snapshot: &mut buck2_data::Snapshot) {}
 
-    /// Returns artifact entries for the given `paths`.
+    /// Preserves the complete value needed to re-declare a matching artifact.
     ///
     /// If `fetch_root_artifact_entries_for_subpaths` is false, only returns entries
     /// for paths that exactly match a known artifact root.
@@ -319,18 +446,25 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
     /// not actually exist within the artifact's directory structure.
     ///
     /// Returns `None` for any path that doesn't match a known artifact.
-    async fn get_artifact_entries_for_materialized_paths(
+    async fn get_artifact_values_for_materialized_paths(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
         fetch_root_artifact_entries_for_subpaths: bool,
-    ) -> buck2_error::Result<
-        Vec<
-            Option<(
-                ProjectRelativePathBuf,
-                ActionDirectoryEntry<ActionSharedDirectory>,
-            )>,
-        >,
-    >;
+    ) -> buck2_error::Result<Vec<Option<(ProjectRelativePathBuf, ArtifactValue)>>>;
+
+    async fn get_identical_action(
+        &self,
+        key: IdenticalActionReuseKey,
+    ) -> buck2_error::Result<Option<ActionReuseOutputs>>;
+
+    async fn get_dep_file(
+        &self,
+        key: DepFileActionReuseKey,
+    ) -> buck2_error::Result<Option<DepFileActionReuseData>>;
+
+    async fn put_action_reuse(&self, write: ActionReuseWrite) -> buck2_error::Result<()>;
+
+    async fn touch_action_reuse(&self, key: ActionReuseKey) -> buck2_error::Result<()>;
 
     /// Whether eager materialization is enabled for this materializer.
     fn is_eager_materialization_enabled(&self) -> bool {
@@ -430,14 +564,13 @@ impl dyn Materializer {
     fn check_declared_external_symlink(&self, value: &ArtifactValue) -> buck2_error::Result<()> {
         if let DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(external_symlink)) =
             value.entry()
+            && !external_symlink.remaining_path().is_empty()
         {
-            if !external_symlink.remaining_path().is_empty() {
-                return Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::Tier0,
-                    "Internal error: external symlink should not be declared on materializer with non-empty remaining path: '{}'",
-                    external_symlink.dupe().to_path_buf().display()
-                ));
-            }
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Internal error: external symlink should not be declared on materializer with non-empty remaining path: '{}'",
+                external_symlink.dupe().to_path_buf().display()
+            ));
         }
         Ok(())
     }
@@ -787,4 +920,34 @@ pub struct CleanStaleArtifactsArgs {
     pub tracked_only: bool,
     pub adaptive_low_disk_threshold: Option<f64>,
     pub adaptive_min_ttl: Option<std::time::Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_reuse_outputs_reject_empty_and_duplicate_paths() {
+        assert!(ActionReuseOutputs::new(Vec::new()).is_err());
+
+        let output_path = ForwardRelativePathBuf::unchecked_new("output".to_owned());
+
+        assert!(
+            ActionReuseOutputs::new(vec![
+                ActionReuseOutput {
+                    output_path: output_path.clone(),
+                    content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+                    artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[0; 32][..],)
+                        .unwrap(),
+                },
+                ActionReuseOutput {
+                    output_path,
+                    content_based_path_hash: ContentBasedPathHash::Scratch,
+                    artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[1; 32][..],)
+                        .unwrap(),
+                },
+            ])
+            .is_err()
+        );
+    }
 }

@@ -103,26 +103,38 @@ mod state_machine {
     use std::thread;
 
     use assert_matches::assert_matches;
+    use buck2_common::cas_digest::CasDigestData;
+    use buck2_common::file_ops::metadata::FileDigest;
     use buck2_common::file_ops::metadata::Symlink;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::content_hash::ContentBasedPathHash;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_error::BuckErrorContext;
     use buck2_error::buck2_error;
     use buck2_events::daemon_id::DaemonId;
     use buck2_events::source::ChannelEventSource;
+    use buck2_execute::artifact_value::ArtifactValueFingerprint;
     use buck2_execute::directory::ActionDirectoryEntry;
     use buck2_execute::directory::ActionSharedDirectory;
     use buck2_execute::directory::INTERNER;
+    use buck2_execute::execute::action_digest::ActionDigest;
     use buck2_execute::execute::blocking::IoRequest;
+    use buck2_execute::materialize::materializer::ActionReuseOutput;
+    use buck2_execute::materialize::materializer::ActionReuseOutputs;
+    use buck2_execute::materialize::materializer::ActionReuseWrite;
+    use buck2_execute::materialize::materializer::IdenticalActionReuseKey;
     use buck2_fs::fs_util::ReadDir;
     use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::RelativePathBuf;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+    use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
     use buck2_util::threads::ignore_stack_overflow_checks_for_future;
     use buck2_wrapper_common::invocation_id::TraceId;
     use futures::StreamExt;
     use futures::future::BoxFuture;
     use futures::future::FutureExt;
+    use tokio::runtime::Builder;
     use tokio::time::Duration as TokioDuration;
     use tokio::time::sleep;
 
@@ -132,6 +144,12 @@ mod state_machine {
     use crate::materializers::deferred::subscriptions::MaterializerSubscriptionOperation;
     use crate::materializers::deferred::subscriptions::SubscriptionHandle;
     use crate::sqlite::materializer_db::testing_materializer_state_sqlite_db;
+
+    #[derive(Clone, Copy)]
+    enum MaterializerMode {
+        DeferredWrites,
+        EagerWrites,
+    }
 
     #[derive(Debug, Eq, PartialEq, Allocative)]
     enum Op {
@@ -238,7 +256,7 @@ mod state_machine {
         ) -> BoxFuture<'a, Result<(), SharedMaterializingError>> {
             self.actually_write(&path, &write);
             async move {
-                let _ignored = command_sender.send_low_priority(
+                let _ = command_sender.send_low_priority(
                     LowPriorityMaterializerCommand::MaterializationFinished {
                         path,
                         timestamp: Utc::now(),
@@ -268,7 +286,7 @@ mod state_machine {
             self.log.lock().push((Op::Clean, path.clone()));
 
             async move {
-                let _ignored = command_sender.send_low_priority(
+                let _ = command_sender.send_low_priority(
                     LowPriorityMaterializerCommand::CleanupFinished {
                         path,
                         version,
@@ -485,9 +503,183 @@ mod state_machine {
         (dm, receiver)
     }
 
+    #[test]
+    fn match_artifacts_updates_present_generated_dependencies() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (mut dm, _) = make_processor(Default::default());
+        let digest_config = dm.io.digest_config();
+
+        let mut first_deps = ActionDirectoryBuilder::empty();
+        first_deps
+            .insert(
+                ForwardRelativePath::unchecked_new("first"),
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                    digest: TrackedFileDigest::from_content(
+                        b"first",
+                        digest_config.cas_digest_config(),
+                    ),
+                    is_executable: false,
+                })),
+            )
+            .unwrap();
+        let first_deps = first_deps
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+        let mut second_deps = ActionDirectoryBuilder::empty();
+        second_deps
+            .insert(
+                ForwardRelativePath::unchecked_new("second"),
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                    digest: TrackedFileDigest::from_content(
+                        b"second",
+                        digest_config.cas_digest_config(),
+                    ),
+                    is_executable: false,
+                })),
+            )
+            .unwrap();
+        let second_deps = second_deps
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+
+        let entry = DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(b"entry", digest_config.cas_digest_config()),
+            is_executable: false,
+        }));
+        let dependencies = [None, Some(first_deps), Some(second_deps)];
+        let mut case = 0;
+        for stored_first in &dependencies {
+            for stored_second in &dependencies {
+                for cached_first in &dependencies {
+                    for cached_second in &dependencies {
+                        let first_path = make_path(&format!("match/{case}/first"));
+                        let second_path = make_path(&format!("match/{case}/second"));
+                        dm.testing_declare_existing(
+                            &first_path,
+                            ArtifactValue::new(
+                                entry.dupe(),
+                                stored_first.as_ref().map(|deps| deps.dupe()),
+                            ),
+                        );
+                        dm.testing_declare_existing(
+                            &second_path,
+                            ArtifactValue::new(
+                                entry.dupe(),
+                                stored_second.as_ref().map(|deps| deps.dupe()),
+                            ),
+                        );
+
+                        let (sender, mut receiver) = oneshot::channel();
+                        dm.testing_process_one_command(MaterializerCommand::MatchArtifacts(
+                            vec![
+                                (
+                                    first_path.clone(),
+                                    ArtifactValue::new(
+                                        entry.dupe(),
+                                        cached_first.as_ref().map(|deps| deps.dupe()),
+                                    ),
+                                ),
+                                (
+                                    second_path.clone(),
+                                    ArtifactValue::new(
+                                        entry.dupe(),
+                                        cached_second.as_ref().map(|deps| deps.dupe()),
+                                    ),
+                                ),
+                            ],
+                            sender,
+                        ));
+                        assert!(receiver.try_recv().unwrap());
+
+                        for (path, stored_deps, cached_deps) in [
+                            (first_path, stored_first, cached_first),
+                            (second_path, stored_second, cached_second),
+                        ] {
+                            let data = dm.tree.prefix_get(&mut path.iter()).unwrap();
+                            let ArtifactMaterializationStage::Materialized { active, .. } =
+                                &data.stage
+                            else {
+                                panic!("matched artifact was not materialized");
+                            };
+                            assert!(*active);
+                            let expected_deps = cached_deps.as_ref().or(stored_deps.as_ref());
+                            assert_eq!(
+                                data.deps.as_ref().map(|deps| deps.fingerprint()),
+                                expected_deps.map(|deps| deps.fingerprint()),
+                            );
+                        }
+                        case += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(case, 81);
+    }
+
+    #[test]
+    fn match_artifacts_persists_preserved_artifact_value_fields() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (mut dm, _) = make_processor(Default::default());
+        let digest_config = dm.io.digest_config();
+        let path = make_path("match/persisted");
+        let entry = DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(b"entry", digest_config.cas_digest_config()),
+            is_executable: false,
+        }));
+        let mut deps = ActionDirectoryBuilder::empty();
+        deps.insert(
+            ForwardRelativePath::unchecked_new("dependency"),
+            DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                digest: TrackedFileDigest::from_content(
+                    b"dependency",
+                    digest_config.cas_digest_config(),
+                ),
+                is_executable: false,
+            })),
+        )
+        .unwrap();
+        let deps = deps
+            .fingerprint(digest_config.as_directory_serializer())
+            .shared(&*INTERNER);
+        dm.testing_declare_existing(
+            &path,
+            ArtifactValue::new(entry.dupe(), Some(deps.dupe()))
+                .with_content_based_path_hash(ContentBasedPathHash::Scratch),
+        );
+
+        let (sender, mut receiver) = oneshot::channel();
+        dm.testing_process_one_command(MaterializerCommand::MatchArtifacts(
+            vec![(path.clone(), ArtifactValue::new(entry, None))],
+            sender,
+        ));
+        assert!(receiver.try_recv().unwrap());
+
+        let state = dm
+            .sqlite_db
+            .as_ref()
+            .unwrap()
+            .tables
+            .domain_table
+            .materializer_state
+            .read_materializer_state(digest_config)
+            .unwrap();
+        let persisted = state.into_iter().find(|entry| entry.path == path).unwrap();
+        assert_eq!(
+            persisted.value.deps().map(|deps| deps.fingerprint()),
+            Some(deps.fingerprint()),
+        );
+        assert_eq!(
+            persisted.value.explicit_content_based_path_hash(),
+            Some(&ContentBasedPathHash::Scratch),
+        );
+    }
+
     async fn make_materializer(
         io: Arc<StubIoHandler>,
         clean_stale_config: Option<CleanStaleConfig>,
+        mode: MaterializerMode,
     ) -> (
         DeferredMaterializerAccessor<StubIoHandler>,
         SubscriptionHandle<StubIoHandler>,
@@ -495,7 +687,11 @@ mod state_machine {
     ) {
         let (mut processor, command_sender, command_receiver, daemon_dispatcher_events) =
             make_processor_for_io(io.dupe());
-
+        let defer_write_actions = match mode {
+            MaterializerMode::DeferredWrites => true,
+            MaterializerMode::EagerWrites => false,
+        };
+        processor.defer_write_actions = defer_write_actions;
         let handle = {
             let (sender, recv) = oneshot::channel();
             MaterializerSubscriptionOperation::Create { sender }.execute(&mut processor);
@@ -529,7 +725,7 @@ mod state_machine {
                 command_thread: Some(command_thread),
                 command_sender,
                 materialize_final_artifacts: true,
-                defer_write_actions: true,
+                defer_write_actions,
                 eager_materialization_enabled: true,
                 io,
                 materializer_state_info: buck2_data::MaterializerStateInfo {
@@ -548,7 +744,8 @@ mod state_machine {
             let io = Arc::new(StubIoHandler::new(temp_root()));
             let path = make_path("foo/bar");
             let artifact = ArtifactValue::file(io.digest_config().empty_file());
-            let (dm, _handle, _daemon_dispatcher_events) = make_materializer(io, None).await;
+            let (dm, _handle, _daemon_dispatcher_events) =
+                make_materializer(io, None, MaterializerMode::DeferredWrites).await;
 
             dm.declare_existing(vec![DeclareArtifactPayload {
                 path,
@@ -603,7 +800,7 @@ mod state_machine {
             dm.testing_declare(&path2, value.dupe());
             assert_eq!(dm.io.take_log(), &[(Op::Clean, path2.clone())]);
 
-            let _ignore = dm
+            let _ = dm
                 .materialize_artifact(&path2, EventDispatcher::null())
                 .ok_or_else(|| internal_error!("Expected a future"))?
                 .await;
@@ -914,7 +1111,9 @@ mod state_machine {
             dm.sqlite_db
                 .as_mut()
                 .expect("db missing")
-                .materializer_state_table()
+                .tables
+                .domain_table
+                .materializer_state
                 .delete(vec![path.clone()])
                 .buck_error_context("delete failed")
                 .unwrap();
@@ -1126,12 +1325,13 @@ mod state_machine {
             let path = make_path(SAMPLE_BUCK_OUT_PATH);
             let project_root = temp_root();
             let io = Arc::new(StubIoHandler::new(project_root.clone()));
-            let (dm, mut handle, _) = make_materializer(io.dupe(), None).await;
+            let (dm, mut handle, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
             materialize_write(&path, b"contents", &mut handle, &dm).await?;
             // Drop dm and flush sqlite connection.
             dm.abort();
             // Create new materializer from db state so that artifacts are not active
-            let (dm, _, _) = make_materializer(io, None).await;
+            let (dm, _, _) = make_materializer(io, None, MaterializerMode::DeferredWrites).await;
 
             let res = dm
                 .clean_stale_artifacts(CleanStaleArtifactsArgs {
@@ -1167,13 +1367,298 @@ mod state_machine {
         .await
     }
 
+    async fn put_stale_persistent_action_reuse_entry(
+        dm: &DeferredMaterializerAccessor<StubIoHandler>,
+        io: &StubIoHandler,
+    ) -> buck2_error::Result<IdenticalActionReuseKey> {
+        let action_digest: ActionDigest =
+            FileDigest::from_content(b"stale action", io.digest_config().cas_digest_config())
+                .coerce();
+        let mut local_reuse_key = CasDigestData::digester(io.digest_config().cas_digest_config());
+        local_reuse_key.update(b"stale local context");
+        let key = IdenticalActionReuseKey {
+            action_digest,
+            local_reuse_key: local_reuse_key.finalize(),
+        };
+        dm.put_action_reuse(ActionReuseWrite::IdenticalAction {
+            key: key.dupe(),
+            outputs: ActionReuseOutputs::new(vec![ActionReuseOutput {
+                output_path: ForwardRelativePathBuf::unchecked_new("out".to_owned()),
+                content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[0; 32][..])?,
+            }])?,
+        })
+        .await?;
+        Ok(key)
+    }
+
+    #[tokio::test]
+    async fn action_reuse_is_disabled_without_sqlite() -> buck2_error::Result<()> {
+        let project_root = temp_root();
+        let io = Arc::new(StubIoHandler::new(project_root));
+        let (mut processor, _, _, _) = make_processor_for_io(io.dupe());
+        processor.sqlite_db = None;
+
+        let action_digest: ActionDigest =
+            FileDigest::from_content(b"action", io.digest_config().cas_digest_config()).coerce();
+        let mut local_reuse_key = CasDigestData::digester(io.digest_config().cas_digest_config());
+        local_reuse_key.update(b"local context");
+        let local_reuse_key = local_reuse_key.finalize();
+        let identical_action_key = IdenticalActionReuseKey {
+            action_digest,
+            local_reuse_key: local_reuse_key.dupe(),
+        };
+        let dep_file_key = DepFileActionReuseKey {
+            common_digest: local_reuse_key.dupe(),
+            declared_dep_files_digest: local_reuse_key.dupe(),
+            execution_platform_digest: local_reuse_key.dupe(),
+            local_reuse_key,
+        };
+        let outputs = ActionReuseOutputs::new(vec![ActionReuseOutput {
+            output_path: ForwardRelativePathBuf::unchecked_new("out".to_owned()),
+            content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+            artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[0; 32][..])?,
+        }])?;
+
+        let (sender, receiver) = oneshot::channel();
+        processor.testing_process_one_command(MaterializerCommand::GetIdenticalAction(
+            identical_action_key.dupe(),
+            sender,
+        ));
+        assert!(receiver.await??.is_none());
+
+        let (sender, receiver) = oneshot::channel();
+        processor
+            .testing_process_one_command(MaterializerCommand::GetDepFile(dep_file_key, sender));
+        assert!(receiver.await??.is_none());
+
+        let (sender, receiver) = oneshot::channel();
+        processor.testing_process_one_command(MaterializerCommand::PutActionReuse(
+            Box::new(ActionReuseWrite::IdenticalAction {
+                key: identical_action_key.dupe(),
+                outputs,
+            }),
+            sender,
+        ));
+        receiver.await??;
+
+        let (sender, receiver) = oneshot::channel();
+        processor.testing_process_one_command(MaterializerCommand::TouchActionReuse(
+            identical_action_key.into(),
+            sender,
+        ));
+        receiver.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_action_reuse_clean_stale_stats_are_merged() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root));
+            let (dm, _, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::EagerWrites).await;
+            let key = put_stale_persistent_action_reuse_entry(&dm, &io).await?;
+
+            let res = dm
+                .clean_stale_artifacts(CleanStaleArtifactsArgs {
+                    keep_since_time: DateTime::<Utc>::MAX_UTC,
+                    dry_run: false,
+                    tracked_only: false,
+                    adaptive_low_disk_threshold: None,
+                    adaptive_min_ttl: None,
+                })
+                .await?;
+
+            assert!(res.message.is_none());
+            let stats = res.stats.as_ref().unwrap();
+            assert_eq!(stats.stale_persistent_action_reuse_entry_count, 1);
+            assert_eq!(stats.cleaned_persistent_action_reuse_entry_count, 1);
+            assert!(dm.get_identical_action(key).await?.is_none());
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn persistent_action_reuse_clean_stale_manual_path_does_not_require_scheduled_config()
+    -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root));
+            let (dm, _, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
+            let key = put_stale_persistent_action_reuse_entry(&dm, &io).await?;
+
+            let res = dm
+                .clean_stale_artifacts(CleanStaleArtifactsArgs {
+                    keep_since_time: DateTime::<Utc>::MAX_UTC,
+                    dry_run: false,
+                    tracked_only: false,
+                    adaptive_low_disk_threshold: None,
+                    adaptive_min_ttl: None,
+                })
+                .await?;
+
+            let stats = res.stats.as_ref().unwrap();
+            assert_eq!(stats.cleaned_persistent_action_reuse_entry_count, 1);
+            assert!(dm.get_identical_action(key).await?.is_none());
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_declare_match_marks_materialized_artifact_active() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let path = make_path(SAMPLE_BUCK_OUT_PATH);
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, mut handle, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
+
+            let mut artifacts = dm
+                .declare_write(Box::new(|| {
+                    Ok(vec![WriteRequest {
+                        path: path.clone(),
+                        content: b"contents".to_vec(),
+                        is_executable: false,
+                        configuration_path: None,
+                    }])
+                }))
+                .await?;
+            let artifact = artifacts.pop().unwrap();
+
+            handle.subscribe_to_paths(vec![path.clone()]);
+            dm.materialize_many(vec![path.clone()])
+                .await?
+                .next()
+                .await
+                .unwrap()?;
+            handle.receiver().recv().await;
+            dm.abort();
+
+            let (dm, _, _) = make_materializer(io, None, MaterializerMode::DeferredWrites).await;
+            assert!(
+                dm.declare_match(vec![(path.clone(), artifact)])
+                    .await?
+                    .is_match()
+            );
+
+            let res = dm
+                .clean_stale_artifacts(CleanStaleArtifactsArgs {
+                    keep_since_time: DateTime::<Utc>::MAX_UTC,
+                    dry_run: false,
+                    tracked_only: false,
+                    adaptive_low_disk_threshold: None,
+                    adaptive_min_ttl: None,
+                })
+                .await?;
+
+            let &buck2_data::CleanStaleStats {
+                stale_artifact_count,
+                stale_bytes,
+                cleaned_artifact_count,
+                cleaned_bytes,
+                ..
+            } = res
+                .stats
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
+            assert_eq!(
+                (
+                    stale_artifact_count,
+                    stale_bytes,
+                    cleaned_artifact_count,
+                    cleaned_bytes
+                ),
+                (0, 0, 0, 0)
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn failed_declare_match_does_not_activate_partial_output_set() -> buck2_error::Result<()>
+    {
+        ignore_stack_overflow_checks_for_future(async {
+            let first_path = make_path("buck-out/v2/gen/root/first");
+            let second_path = make_path("buck-out/v2/gen/root/second");
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, mut handle, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
+
+            let artifacts = dm
+                .declare_write(Box::new(|| {
+                    Ok(vec![
+                        WriteRequest {
+                            path: first_path.clone(),
+                            content: b"first".to_vec(),
+                            is_executable: false,
+                            configuration_path: None,
+                        },
+                        WriteRequest {
+                            path: second_path.clone(),
+                            content: b"second".to_vec(),
+                            is_executable: false,
+                            configuration_path: None,
+                        },
+                    ])
+                }))
+                .await?;
+            handle.subscribe_to_paths(vec![first_path.clone(), second_path.clone()]);
+            let mut materializations = dm
+                .materialize_many(vec![first_path.clone(), second_path.clone()])
+                .await?;
+            while let Some(materialization) = materializations.next().await {
+                materialization?;
+            }
+            handle.receiver().recv().await;
+            dm.abort();
+
+            let (dm, _, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
+            let first_artifact = artifacts[0].dupe();
+            let wrong_second_artifact = ArtifactValue::file(io.digest_config().empty_file());
+            assert!(
+                !dm.declare_match(vec![
+                    (first_path, first_artifact),
+                    (second_path, wrong_second_artifact),
+                ])
+                .await?
+                .is_match()
+            );
+
+            let result = dm
+                .clean_stale_artifacts(CleanStaleArtifactsArgs {
+                    keep_since_time: DateTime::<Utc>::MAX_UTC,
+                    dry_run: false,
+                    tracked_only: false,
+                    adaptive_low_disk_threshold: None,
+                    adaptive_min_ttl: None,
+                })
+                .await?;
+            let stats = result.stats.unwrap();
+            assert_eq!(stats.cleaned_artifact_count, 2);
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn test_clean_stale_interrupt() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let path = make_path(SAMPLE_BUCK_OUT_PATH);
             let project_root = temp_root();
             let io = Arc::new(StubIoHandler::new(project_root.clone()));
-            let (dm, mut handle, _) = make_materializer(io.dupe(), None).await;
+            let (dm, mut handle, _) =
+                make_materializer(io.dupe(), None, MaterializerMode::DeferredWrites).await;
             materialize_write(&path, b"contents", &mut handle, &dm).await?;
 
             let read_dir_barriers =
@@ -1182,7 +1667,7 @@ mod state_machine {
                 StubIoHandler::new(project_root.dupe())
                     .with_read_dir_barriers(read_dir_barriers.dupe()),
             );
-            let (dm, _, _) = make_materializer(io, None).await;
+            let (dm, _, _) = make_materializer(io, None, MaterializerMode::DeferredWrites).await;
 
             // Interrupt while scanning buck-out
             let dm = Arc::new(dm);
@@ -1199,7 +1684,7 @@ mod state_machine {
                 read_dir_barriers.0.wait();
                 // Sending a high_priority command will interrupt the processor
                 let noop_command = MaterializerCommand::DeclareExisting(vec![], None, None);
-                let _unused = dm.command_sender.send(noop_command);
+                let _ = dm.command_sender.send(noop_command);
                 // Wait after sending so that a second request doesn't start
                 read_dir_barriers.1.wait();
             });
@@ -1225,7 +1710,7 @@ mod state_machine {
             let io = Arc::new(
                 StubIoHandler::new(project_root.dupe()).with_clean_barriers(clean_barriers.dupe()),
             );
-            let (dm, _, _) = make_materializer(io, None).await;
+            let (dm, _, _) = make_materializer(io, None, MaterializerMode::DeferredWrites).await;
 
             // Interrupt while deleting files
             let dm = Arc::new(dm);
@@ -1242,7 +1727,7 @@ mod state_machine {
                 clean_barriers.0.wait();
                 // Sending a high_priority command will drop the clean guard immediately (from this thread)
                 let noop_command = MaterializerCommand::DeclareExisting(vec![], None, None);
-                let _unused = dm.command_sender.send(noop_command);
+                let _ = dm.command_sender.send(noop_command);
                 // Wait after sending, executing clean request will complete but a second request doesn't start because
                 // the single io thread is blocked
                 clean_barriers.1.wait();
@@ -1284,8 +1769,12 @@ mod state_machine {
                 dry_run: true,
             };
             let io = Arc::new(StubIoHandler::new(project_root.dupe()));
-            let (dm, mut handle, mut daemon_dispatcher_events) =
-                make_materializer(io.dupe(), Some(clean_stale_config)).await;
+            let (dm, mut handle, mut daemon_dispatcher_events) = make_materializer(
+                io.dupe(),
+                Some(clean_stale_config),
+                MaterializerMode::DeferredWrites,
+            )
+            .await;
             materialize_write(&path, b"contents", &mut handle, &dm).await?;
 
             let receive_clean_result = |events: &mut ChannelEventSource| {
@@ -1361,7 +1850,7 @@ mod state_machine {
     }
 
     #[tokio::test]
-    async fn test_get_artifact_entries_for_materialized_paths() -> buck2_error::Result<()> {
+    async fn test_get_artifact_values_for_materialized_paths() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let (mut dm, _) = make_processor(Default::default());
             let digest_config = dm.io.digest_config();
@@ -1369,53 +1858,56 @@ mod state_machine {
             // Path not in tree
             let unknown_path = make_path("not/in/tree");
             let result =
-                dm.testing_get_artifact_entries_for_materialized_paths(vec![unknown_path.clone()]);
+                dm.testing_get_artifact_values_for_materialized_paths(vec![unknown_path.clone()]);
             assert_eq!(result.len(), 1);
             assert!(result[0].is_none());
 
             let declared_file_path = make_path("declared/file");
             let file_value = ArtifactValue::file(digest_config.empty_file());
             dm.testing_declare(&declared_file_path, file_value.dupe());
-            let result = dm.testing_get_artifact_entries_for_materialized_paths(vec![
+            let result = dm.testing_get_artifact_values_for_materialized_paths(vec![
                 declared_file_path.clone(),
             ]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
+            let (returned_path, returned_value) = result[0].clone().unwrap();
             assert_eq!(returned_path, declared_file_path);
-            assert_eq!(&returned_entry, file_value.entry());
+            assert_eq!(returned_value, file_value);
 
             let declared_dir_path = make_path("declared/dir");
             let dir_value = ArtifactValue::dir(digest_config.empty_directory());
             dm.testing_declare(&declared_dir_path, dir_value.dupe());
-            let result = dm.testing_get_artifact_entries_for_materialized_paths(vec![
+            let result = dm.testing_get_artifact_values_for_materialized_paths(vec![
                 declared_dir_path.clone(),
             ]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
+            let (returned_path, returned_value) = result[0].clone().unwrap();
             assert_eq!(returned_path, declared_dir_path);
-            assert_eq!(&returned_entry, dir_value.entry());
+            assert_eq!(returned_value, dir_value);
 
             let materialized_file_path = make_path("materialized/file");
             let file_value = ArtifactValue::file(digest_config.empty_file());
             dm.testing_declare_existing(&materialized_file_path, file_value.dupe());
-            let result = dm.testing_get_artifact_entries_for_materialized_paths(vec![
+            let result = dm.testing_get_artifact_values_for_materialized_paths(vec![
                 materialized_file_path.clone(),
             ]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
+            let (returned_path, returned_value) = result[0].clone().unwrap();
             assert_eq!(returned_path, materialized_file_path);
-            assert_eq!(&returned_entry, file_value.entry());
+            assert_eq!(returned_value, file_value);
 
             let materialized_dir_path = make_path("materialized/dir");
             let dir_value = ArtifactValue::dir(digest_config.empty_directory());
             dm.testing_declare_existing(&materialized_dir_path, dir_value.dupe());
-            let result = dm.testing_get_artifact_entries_for_materialized_paths(vec![
+            let result = dm.testing_get_artifact_values_for_materialized_paths(vec![
                 materialized_dir_path.clone(),
             ]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
+            let (returned_path, returned_value) = result[0].clone().unwrap();
             assert_eq!(returned_path, materialized_dir_path);
-            assert!(matches!(returned_entry, ActionDirectoryEntry::Dir(_)));
+            match returned_value.entry() {
+                ActionDirectoryEntry::Dir(_) => {}
+                ActionDirectoryEntry::Leaf(_) => panic!("expected directory artifact"),
+            }
 
             // Subpath of an artifact via projected artifact; returns None
             let parent_path = make_path("parent/artifact");
@@ -1423,7 +1915,7 @@ mod state_machine {
             dm.testing_declare(&parent_path, parent_value);
             let subpath = make_path("parent/artifact/child");
             let result =
-                dm.testing_get_artifact_entries_for_materialized_paths(vec![subpath.clone()]);
+                dm.testing_get_artifact_values_for_materialized_paths(vec![subpath.clone()]);
             assert_eq!(result.len(), 1);
             assert!(result[0].is_none());
 
@@ -1433,7 +1925,7 @@ mod state_machine {
     }
 
     #[tokio::test]
-    async fn test_get_artifact_entries_for_projected_paths() -> buck2_error::Result<()> {
+    async fn test_get_artifact_values_for_projected_paths() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let (mut dm, _) = make_processor(Default::default());
             let digest_config = dm.io.digest_config();
@@ -1469,29 +1961,38 @@ mod state_machine {
             // Subpath of a file within artifact - returns the base artifact entry (Dir), not the projected file
             let file_subpath = make_path("parent/artifact/child/file.txt");
             let result =
-                dm.testing_get_root_artifact_entries_for_subpaths(vec![file_subpath.clone()]);
+                dm.testing_get_root_artifact_values_for_subpaths(vec![file_subpath.clone()]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
-            assert_eq!(returned_path, file_subpath);
-            assert!(matches!(returned_entry, ActionDirectoryEntry::Dir(_)));
+            let (returned_path, returned_value) = result[0].clone().unwrap();
+            assert_eq!(returned_path, artifact_root);
+            match returned_value.entry() {
+                ActionDirectoryEntry::Dir(_) => {}
+                ActionDirectoryEntry::Leaf(_) => panic!("expected directory artifact"),
+            }
 
             // Subpath of a subdirectory within artifact - returns the base artifact entry (Dir)
             let subdir_path = make_path("parent/artifact/child/subdir");
             let result =
-                dm.testing_get_root_artifact_entries_for_subpaths(vec![subdir_path.clone()]);
+                dm.testing_get_root_artifact_values_for_subpaths(vec![subdir_path.clone()]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
-            assert_eq!(returned_path, subdir_path);
-            assert!(matches!(returned_entry, ActionDirectoryEntry::Dir(_)));
+            let (returned_path, returned_value) = result[0].clone().unwrap();
+            assert_eq!(returned_path, artifact_root);
+            match returned_value.entry() {
+                ActionDirectoryEntry::Dir(_) => {}
+                ActionDirectoryEntry::Leaf(_) => panic!("expected directory artifact"),
+            }
 
             // Nonexistent subpath within artifact - still returns the base artifact entry (Dir)
             let nonexistent = make_path("parent/artifact/does_not_exist.txt");
             let result =
-                dm.testing_get_root_artifact_entries_for_subpaths(vec![nonexistent.clone()]);
+                dm.testing_get_root_artifact_values_for_subpaths(vec![nonexistent.clone()]);
             assert_eq!(result.len(), 1);
-            let (returned_path, returned_entry) = result[0].clone().unwrap();
-            assert_eq!(returned_path, nonexistent);
-            assert!(matches!(returned_entry, ActionDirectoryEntry::Dir(_)));
+            let (returned_path, returned_value) = result[0].clone().unwrap();
+            assert_eq!(returned_path, artifact_root);
+            match returned_value.entry() {
+                ActionDirectoryEntry::Dir(_) => {}
+                ActionDirectoryEntry::Leaf(_) => panic!("expected directory artifact"),
+            }
 
             Ok(())
         })

@@ -20,14 +20,18 @@ use futures::stream::StreamExt;
 use gazebo::prelude::*;
 
 use crate::artifact_value::ArtifactValue;
-use crate::directory::ActionDirectoryEntry;
-use crate::directory::ActionSharedDirectory;
+use crate::materialize::materializer::ActionReuseKey;
+use crate::materialize::materializer::ActionReuseOutputs;
+use crate::materialize::materializer::ActionReuseWrite;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::CopiedArtifact;
 use crate::materialize::materializer::DeclareArtifactPayload;
 use crate::materialize::materializer::DeclareMatchOutcome;
+use crate::materialize::materializer::DepFileActionReuseData;
+use crate::materialize::materializer::DepFileActionReuseKey;
 use crate::materialize::materializer::HttpDownloadInfo;
+use crate::materialize::materializer::IdenticalActionReuseKey;
 use crate::materialize::materializer::MaterializationError;
 use crate::materialize::materializer::Materializer;
 use crate::materialize::materializer::WriteRequest;
@@ -131,18 +135,33 @@ impl Materializer for NoDiskMaterializer {
         Ok(paths.into_map(Ok))
     }
 
-    async fn get_artifact_entries_for_materialized_paths(
+    async fn get_artifact_values_for_materialized_paths(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
         _fetch_root_artifact_entries_for_subpaths: bool,
-    ) -> buck2_error::Result<
-        Vec<
-            Option<(
-                ProjectRelativePathBuf,
-                ActionDirectoryEntry<ActionSharedDirectory>,
-            )>,
-        >,
-    > {
+    ) -> buck2_error::Result<Vec<Option<(ProjectRelativePathBuf, ArtifactValue)>>> {
         Ok(vec![None; paths.len()])
+    }
+
+    async fn get_identical_action(
+        &self,
+        _key: IdenticalActionReuseKey,
+    ) -> buck2_error::Result<Option<ActionReuseOutputs>> {
+        Ok(None)
+    }
+
+    async fn get_dep_file(
+        &self,
+        _key: DepFileActionReuseKey,
+    ) -> buck2_error::Result<Option<DepFileActionReuseData>> {
+        Ok(None)
+    }
+
+    async fn put_action_reuse(&self, _write: ActionReuseWrite) -> buck2_error::Result<()> {
+        Ok(())
+    }
+
+    async fn touch_action_reuse(&self, _key: ActionReuseKey) -> buck2_error::Result<()> {
+        Ok(())
     }
 }

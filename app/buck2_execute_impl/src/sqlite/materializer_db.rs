@@ -17,6 +17,7 @@ use buck2_common::sqlite::sqlite_db::SqliteTables;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
@@ -26,36 +27,42 @@ use chrono::DateTime;
 use chrono::Utc;
 use dupe::Dupe;
 
-use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
 use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTable;
+use crate::sqlite::tables::persistent_action_reuse_table::PersistentActionReuseSqliteTable;
 
 /// Hand-maintained schema version for the materializer state sqlite db.
 /// PLEASE bump this version if you are making a breaking change to the
 /// materializer state sqlite db schema! If you forget to bump this version,
 /// then you can fix forward by bumping the `buck2.sqlite_materializer_state_version`
 /// buckconfig in the project root's .buckconfig.
-pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 8;
+pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 9;
 
 #[derive(Debug)]
 pub struct MaterializerStateEntry {
     pub path: ProjectRelativePathBuf,
-    pub metadata: ArtifactMetadata,
+    pub value: ArtifactValue,
     pub last_access_time: DateTime<Utc>,
 }
 
 pub type MaterializerState = Vec<MaterializerStateEntry>;
 
-/// Concrete implementation of SqliteTable for MaterializerStateSqliteTable
-impl SqliteTable for MaterializerStateSqliteTable {
+pub struct MaterializerSqliteTables {
+    pub(crate) materializer_state: MaterializerStateSqliteTable,
+    pub(crate) persistent_action_reuse: PersistentActionReuseSqliteTable,
+}
+
+impl SqliteTable for MaterializerSqliteTables {
     fn create_table(&self) -> buck2_error::Result<()> {
-        MaterializerStateSqliteTable::create_table(self)
+        self.materializer_state.create_table()?;
+        self.persistent_action_reuse.create_table()?;
+        Ok(())
     }
 }
 
 /// DB that opens the sqlite connection to the materializer state db on disk and
 /// holds all the sqlite tables we need for storing/querying materializer state
 pub struct MaterializerStateSqliteDb {
-    tables: SqliteTables<MaterializerStateSqliteTable>,
+    pub(crate) tables: SqliteTables<MaterializerSqliteTables>,
     /// A unique ID identifying this particular instance of the database. This will reset when we
     /// recreate it.
     identity: SqliteIdentity,
@@ -63,7 +70,7 @@ pub struct MaterializerStateSqliteDb {
 
 impl SqliteDb for MaterializerStateSqliteDb {
     type StateType = MaterializerState;
-    type TableType = MaterializerStateSqliteTable;
+    type TableType = MaterializerSqliteTables;
 
     fn new(tables: SqliteTables<Self::TableType>) -> buck2_error::Result<Self> {
         let identity = tables.get_identity()?;
@@ -72,8 +79,11 @@ impl SqliteDb for MaterializerStateSqliteDb {
 
     fn open_tables(path: &AbsNormPath) -> buck2_error::Result<SqliteTables<Self::TableType>> {
         let connection = SqliteTables::<Self::TableType>::create_connection(path)?;
-        let materializer_state_table = MaterializerStateSqliteTable::new(connection.dupe());
-        Ok(SqliteTables::new(materializer_state_table, connection))
+        let tables = MaterializerSqliteTables {
+            materializer_state: MaterializerStateSqliteTable::new(connection.dupe()),
+            persistent_action_reuse: PersistentActionReuseSqliteTable::new(connection.dupe()),
+        };
+        Ok(SqliteTables::new(tables, connection))
     }
 
     fn identity(&self) -> &SqliteIdentity {
@@ -131,11 +141,12 @@ impl MaterializerStateSqliteDb {
             reject_identity.as_ref(),
         ) {
             Ok(db) => {
-                match db
+                let loaded_state = db
                     .tables
                     .domain_table
-                    .read_materializer_state(digest_config)
-                {
+                    .materializer_state
+                    .read_materializer_state(digest_config);
+                match loaded_state {
                     Ok(state) => Ok((db, Ok(state))),
                     Err(e) => {
                         let state = Self::create_sqlite_db(
@@ -156,10 +167,6 @@ impl MaterializerStateSqliteDb {
                 Ok((state, Err(e)))
             }
         }
-    }
-
-    pub(crate) fn materializer_state_table(&mut self) -> &MaterializerStateSqliteTable {
-        &self.tables.domain_table
     }
 }
 
@@ -192,6 +199,7 @@ mod tests {
     use buck2_common::file_ops::metadata::FileMetadata;
     use buck2_common::file_ops::metadata::Symlink;
     use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::content_hash::ContentBasedPathHash;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_directory::directory::builder::DirectoryBuilder;
     use buck2_directory::directory::dashmap_directory_interner::DashMapDirectoryInterner;
@@ -206,6 +214,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
 
     fn artifact_metadata_eq(a: &ArtifactMetadata, b: &ArtifactMetadata) -> bool {
         match (a, b) {
@@ -302,22 +311,26 @@ mod tests {
         let artifacts = vec![
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("a").to_owned(),
-                metadata: DirectoryEntry::Dir(shared_directory),
+                value: ArtifactValue::new(
+                    DirectoryEntry::Dir(shared_directory.dupe()),
+                    Some(shared_directory),
+                )
+                .with_content_based_path_hash(ContentBasedPathHash::Scratch),
                 last_access_time: now_seconds(),
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("b/c").to_owned(),
-                metadata: DirectoryEntry::Leaf(file),
+                value: ArtifactValue::new(DirectoryEntry::Leaf(file), None),
                 last_access_time: now_seconds(),
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("d").to_owned(),
-                metadata: DirectoryEntry::Leaf(symlink),
+                value: ArtifactValue::new(DirectoryEntry::Leaf(symlink), None),
                 last_access_time: now_seconds(),
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("e").to_owned(),
-                metadata: DirectoryEntry::Leaf(external_symlink),
+                value: ArtifactValue::new(DirectoryEntry::Leaf(external_symlink), None),
                 last_access_time: now_seconds(),
             },
         ];
@@ -326,7 +339,7 @@ mod tests {
 
         for (path, entry) in artifacts.iter() {
             table
-                .insert(path, &entry.metadata, entry.last_access_time)
+                .insert(path, &entry.value, entry.last_access_time)
                 .unwrap();
         }
 
@@ -362,7 +375,11 @@ mod tests {
         fn eq(&self, other: &Self) -> bool {
             self.path == other.path
                 && self.last_access_time == other.last_access_time
-                && artifact_metadata_eq(&self.metadata, &other.metadata)
+                && artifact_metadata_eq(self.value.entry(), other.value.entry())
+                && self.value.deps().map(|deps| deps.fingerprint())
+                    == other.value.deps().map(|deps| deps.fingerprint())
+                && self.value.explicit_content_based_path_hash()
+                    == other.value.explicit_content_based_path_hash()
         }
     }
 
@@ -391,10 +408,10 @@ mod tests {
         let fs = ProjectRootTemp::new()?;
 
         let path = ProjectRelativePath::unchecked_new("foo").to_owned();
-        let artifact_metadata = DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+        let artifact_value = ArtifactValue::file(FileMetadata {
             digest: TrackedFileDigest::from_content(b"file", digest_config.cas_digest_config()),
             is_executable: false,
-        }));
+        });
         let timestamp = now_seconds();
         let metadatas = testing_metadatas();
 
@@ -402,7 +419,7 @@ mod tests {
         let v1 = StdBuckHashMap::from([("version".to_owned(), "1".to_owned())]);
 
         {
-            let (mut db, loaded_state) = testing_materializer_state_sqlite_db(
+            let (db, loaded_state) = testing_materializer_state_sqlite_db(
                 fs.path(),
                 v0.clone(),
                 metadatas[0].clone(),
@@ -415,8 +432,10 @@ mod tests {
             }
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[0]);
 
-            db.materializer_state_table()
-                .insert(&path, &artifact_metadata, timestamp)
+            db.tables
+                .domain_table
+                .materializer_state
+                .insert(&path, &artifact_value, timestamp)
                 .unwrap();
         }
 
@@ -427,14 +446,14 @@ mod tests {
             assert_matches!(
                 loaded_state,
                 Ok(v) => {
-                    assert_eq!(v, vec![MaterializerStateEntry {path: path.clone(), metadata: artifact_metadata.clone(), last_access_time: timestamp}]);
+                    assert_eq!(v, vec![MaterializerStateEntry {path: path.clone(), value: artifact_value.dupe(), last_access_time: timestamp}]);
                 }
             );
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[0]);
         }
 
         {
-            let (mut db, loaded_state) = testing_materializer_state_sqlite_db(
+            let (db, loaded_state) = testing_materializer_state_sqlite_db(
                 fs.path(),
                 v1.clone(),
                 metadatas[2].clone(),
@@ -447,8 +466,10 @@ mod tests {
             }
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[2]);
 
-            db.materializer_state_table()
-                .insert(&path, &artifact_metadata, timestamp)
+            db.tables
+                .domain_table
+                .materializer_state
+                .insert(&path, &artifact_value, timestamp)
                 .unwrap();
         }
 
@@ -463,7 +484,7 @@ mod tests {
             assert_matches!(
                 loaded_state,
                 Ok(v) => {
-                    assert_eq!(v, vec![MaterializerStateEntry { path, metadata: artifact_metadata, last_access_time: timestamp }]);
+                    assert_eq!(v, vec![MaterializerStateEntry { path, value: artifact_value, last_access_time: timestamp }]);
                 }
             );
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[2]);

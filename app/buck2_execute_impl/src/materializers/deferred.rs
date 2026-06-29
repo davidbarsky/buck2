@@ -49,10 +49,11 @@ use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::get_dispatcher_opt;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
-use buck2_execute::directory::ActionDirectoryEntry;
 use buck2_execute::directory::ActionDirectoryMember;
-use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::execute::blocking::BlockingExecutor;
+use buck2_execute::materialize::materializer::ActionReuseKey;
+use buck2_execute::materialize::materializer::ActionReuseOutputs;
+use buck2_execute::materialize::materializer::ActionReuseWrite;
 use buck2_execute::materialize::materializer::ArtifactNotMaterializedReason;
 use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::CasNotFoundError;
@@ -60,8 +61,11 @@ use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
 use buck2_execute::materialize::materializer::DeferredMaterializerExtensions;
+use buck2_execute::materialize::materializer::DepFileActionReuseData;
+use buck2_execute::materialize::materializer::DepFileActionReuseKey;
 use buck2_execute::materialize::materializer::EagerMaterializationGuard;
 use buck2_execute::materialize::materializer::HttpDownloadInfo;
+use buck2_execute::materialize::materializer::IdenticalActionReuseKey;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::WriteRequest;
@@ -586,33 +590,63 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         snapshot.deferred_materializer_queue_size = self.command_sender.counters.queue_size() as _;
     }
 
-    async fn get_artifact_entries_for_materialized_paths(
+    async fn get_artifact_values_for_materialized_paths(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
         fetch_root_artifact_entries_for_subpaths: bool,
-    ) -> buck2_error::Result<
-        Vec<
-            Option<(
-                ProjectRelativePathBuf,
-                ActionDirectoryEntry<ActionSharedDirectory>,
-            )>,
-        >,
-    > {
+    ) -> buck2_error::Result<Vec<Option<(ProjectRelativePathBuf, ArtifactValue)>>> {
         let (sender, recv) = oneshot::channel();
 
-        self.command_sender.send(
-            MaterializerCommand::GetArtifactEntriesForMaterializedPaths {
+        self.command_sender
+            .send(MaterializerCommand::GetArtifactValuesForMaterializedPaths {
                 paths,
                 fetch_root_artifact_entries_for_subpaths,
                 sender,
-            },
-        )?;
+            })?;
 
         let result = recv.await.buck_error_context(
-            "Receiving \"artifact entries for materialized paths\" future from command thread.",
+            "Receiving artifact values for materialized paths from command thread.",
         )?;
 
         Ok(result)
+    }
+
+    async fn get_identical_action(
+        &self,
+        key: IdenticalActionReuseKey,
+    ) -> buck2_error::Result<Option<ActionReuseOutputs>> {
+        let (sender, recv) = oneshot::channel();
+        self.command_sender
+            .send(MaterializerCommand::GetIdenticalAction(key, sender))?;
+        recv.await
+            .buck_error_context("No response from materializer")?
+    }
+
+    async fn get_dep_file(
+        &self,
+        key: DepFileActionReuseKey,
+    ) -> buck2_error::Result<Option<DepFileActionReuseData>> {
+        let (sender, recv) = oneshot::channel();
+        self.command_sender
+            .send(MaterializerCommand::GetDepFile(key, sender))?;
+        recv.await
+            .buck_error_context("No response from materializer")?
+    }
+
+    async fn put_action_reuse(&self, write: ActionReuseWrite) -> buck2_error::Result<()> {
+        let (sender, recv) = oneshot::channel();
+        self.command_sender
+            .send(MaterializerCommand::PutActionReuse(Box::new(write), sender))?;
+        recv.await
+            .buck_error_context("No response from materializer")?
+    }
+
+    async fn touch_action_reuse(&self, key: ActionReuseKey) -> buck2_error::Result<()> {
+        let (sender, recv) = oneshot::channel();
+        self.command_sender
+            .send(MaterializerCommand::TouchActionReuse(key, sender))?;
+        recv.await
+            .buck_error_context("No response from materializer")?
     }
 
     fn is_eager_materialization_enabled(&self) -> bool {
@@ -692,7 +726,6 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
             io_executor,
             http_client,
         ));
-
         let command_processor = {
             let command_sender = command_sender.dupe();
             let rt = Handle::current();

@@ -171,7 +171,7 @@ impl<T: IoHandler> ExtensionCommand<T> for CleanStaleArtifactsExtensionCommand {
         let fut = self
             .cmd
             .create_clean_fut(processor, Some(trace_id), daemon_id);
-        let _ignored = self.sender.send(fut);
+        let _ = self.sender.send(fut);
     }
 }
 
@@ -184,23 +184,50 @@ impl CleanStaleArtifactsCommand {
     ) -> BoxFuture<'static, buck2_error::Result<CleanResult>> {
         let start_time = Instant::now();
         let pending_result = self.create_pending_clean_result(processor);
-        let dispatcher_dup = self.dispatcher.dupe();
+        let keep_since_time = self.keep_since_time;
+        let dry_run = self.dry_run;
+        let persistent_action_reuse = processor.sqlite_db.as_ref().map(|sqlite_db| {
+            let table = sqlite_db.tables.domain_table.persistent_action_reuse.dupe();
+            tokio::task::spawn_blocking(move || table.clean_stale(keep_since_time, dry_run))
+        });
+        let dispatcher = self.dispatcher.dupe();
         async move {
-            let result = match pending_result {
-                Ok(res) => match res {
-                    PendingCleanResult::Finished(result) => Ok(result),
-                    PendingCleanResult::Pending(fut) => fut.await,
-                },
-                Err(e) => Err(e),
+            let mut result = match pending_result {
+                Ok(PendingCleanResult::Finished(result)) => Ok(result),
+                Ok(PendingCleanResult::Pending(fut)) => fut.await,
+                Err(error) => Err(error),
             };
-            let result: Result<CleanResult, buck2_error::Error> = result;
+            let persistent_action_reuse = match persistent_action_reuse {
+                Some(task) => match task.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.into()),
+                },
+                None => Ok(Default::default()),
+            };
+            match persistent_action_reuse {
+                Ok(persistent_action_reuse) => {
+                    if let Ok(result) = &mut result {
+                        result.stats.stale_persistent_action_reuse_entry_count =
+                            persistent_action_reuse.stale_entry_count;
+                        result.stats.cleaned_persistent_action_reuse_entry_count =
+                            persistent_action_reuse.cleaned_entry_count;
+                        if (result.kind == CleanStaleResultKind::SkippedNoGenDir
+                            || result.kind == CleanStaleResultKind::SkippedDeferWriteDisabled)
+                            && persistent_action_reuse.stale_entry_count != 0
+                        {
+                            result.kind = CleanStaleResultKind::Finished;
+                        }
+                    }
+                }
+                Err(error) => result = Err(error),
+            }
             let result_event: buck2_data::CleanStaleResult = create_result(
                 result.clone(),
                 trace_id,
                 &daemon_id,
                 (Instant::now() - start_time).as_secs(),
             );
-            dispatcher_dup.instant_event(result_event);
+            dispatcher.instant_event(result_event);
             result
         }
         .boxed()
@@ -213,21 +240,21 @@ impl CleanStaleArtifactsCommand {
         let (liveliness_observer, liveliness_guard) = LivelinessGuard::create_sync();
         *processor.command_sender.clean_guard.write() = Some(liveliness_guard);
 
-        if let Some(sqlite_db) = processor.sqlite_db.as_mut() {
-            if !processor.defer_write_actions {
-                Ok(CleanStaleResultKind::SkippedDeferWriteDisabled.into())
-            } else {
-                self.scan_and_create_clean_fut(
-                    &mut processor.tree,
-                    sqlite_db,
-                    &processor.io,
-                    processor.cancellations,
-                    liveliness_observer.clone(),
-                )
-            }
-        } else {
-            Ok(CleanStaleResultKind::SkippedSqliteDisabled.into())
+        let Some(sqlite_db) = processor.sqlite_db.as_mut() else {
+            return Ok(CleanStaleResultKind::SkippedSqliteDisabled.into());
+        };
+
+        if !processor.defer_write_actions {
+            return Ok(CleanStaleResultKind::SkippedDeferWriteDisabled.into());
         }
+
+        self.scan_and_create_clean_fut(
+            &mut processor.tree,
+            sqlite_db,
+            &processor.io,
+            processor.cancellations,
+            liveliness_observer,
+        )
     }
 
     fn scan_and_create_clean_fut<T: IoHandler>(
@@ -239,7 +266,6 @@ impl CleanStaleArtifactsCommand {
         liveliness_observer: Arc<dyn LivelinessObserverSync>,
     ) -> buck2_error::Result<PendingCleanResult> {
         let start_time = Instant::now();
-
         let mut artifact_dirs = Vec::new();
         for dir_name in &["gen", "art"] {
             let dir_path = io
@@ -299,7 +325,7 @@ impl CleanStaleArtifactsCommand {
                     params.min_access_time,
                 ),
                 Err(e) => {
-                    let _unused = soft_error!("disk_space_stats", e);
+                    let _ = soft_error!("disk_space_stats", e);
                 }
             }
         }
@@ -334,7 +360,9 @@ impl CleanStaleArtifactsCommand {
             // Just need to know if any entries exist, could be a simpler query.
             // Checking the db directly in case tree is somehow not in sync.
             let materializer_state = sqlite_db
-                .materializer_state_table()
+                .tables
+                .domain_table
+                .materializer_state
                 .read_materializer_state(io.digest_config())?;
 
             // Entries in the db should have been found in buck-out, return error and skip cleaning untracked artifacts.
@@ -375,7 +403,7 @@ pub(crate) struct CleanStaleError {
     stats: buck2_data::CleanStaleStats,
 }
 
-fn stats_for_paths(paths: &Vec<FoundPath>) -> buck2_data::CleanStaleStats {
+fn stats_for_paths(paths: &[FoundPath]) -> buck2_data::CleanStaleStats {
     let mut stats = buck2_data::CleanStaleStats::default();
     for path in paths {
         match path {

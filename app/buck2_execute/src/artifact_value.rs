@@ -9,6 +9,7 @@
  */
 
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -20,13 +21,14 @@ use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_util::strong_hasher::Blake3StrongHasher;
 use dupe::Dupe;
 use pagable::Pagable;
+use strong_hash::StrongHash;
 
 use crate::directory::ActionDirectoryEntry;
 use crate::directory::ActionDirectoryMember;
 use crate::directory::ActionSharedDirectory;
 
 #[derive(Clone, Dupe, Debug, PartialEq, Eq, Allocative, Pagable)]
-pub enum UnderlyingContentBasedPathHash {
+enum UnderlyingContentBasedPathHash {
     Inferred,
     Explicit(Arc<ContentBasedPathHash>),
 }
@@ -53,6 +55,98 @@ pub struct ArtifactValue {
     /// The content-based path hash of the artifact. This is usually inferred,
     /// but in some cases (e.g. projected artifacts) it is explicitly provided.
     content_based_path_hash: UnderlyingContentBasedPathHash,
+}
+
+/// Commits to every part of an [`ArtifactValue`] that participates in equality.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ArtifactValueFingerprint([u8; 32]);
+
+impl AsRef<[u8]> for ArtifactValueFingerprint {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<&[u8]> for ArtifactValueFingerprint {
+    type Error = buck2_error::Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(Self(value.try_into().map_err(|_| {
+            buck2_error::internal_error!(
+                "Artifact value fingerprint must contain 32 bytes, got {}",
+                value.len()
+            )
+        })?))
+    }
+}
+
+impl From<&ArtifactValue> for ArtifactValueFingerprint {
+    fn from(value: &ArtifactValue) -> Self {
+        let mut hasher = Blake3StrongHasher::new();
+        value.strong_hash(&mut hasher);
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl StrongHash for ArtifactValue {
+    fn strong_hash<H: Hasher>(&self, state: &mut H) {
+        fn write_bytes<H: Hasher>(state: &mut H, bytes: &[u8]) {
+            state.write(&(bytes.len() as u64).to_le_bytes());
+            state.write(bytes);
+        }
+
+        fn write_digest<H: Hasher>(state: &mut H, digest: &FileDigest) {
+            state.write(&[digest.raw_digest().algorithm() as u8]);
+            write_bytes(state, digest.raw_digest().as_bytes());
+            state.write(&digest.size().to_le_bytes());
+        }
+
+        state.write(b"artifact-value-v1");
+        match &self.entry {
+            ActionDirectoryEntry::Dir(directory) => {
+                state.write(&[0]);
+                write_digest(state, directory.fingerprint().data());
+            }
+            ActionDirectoryEntry::Leaf(ActionDirectoryMember::File(file)) => {
+                state.write(&[1]);
+                write_digest(state, file.digest.data());
+                state.write(&[u8::from(file.is_executable)]);
+            }
+            ActionDirectoryEntry::Leaf(ActionDirectoryMember::Symlink(symlink)) => {
+                state.write(&[2]);
+                write_bytes(state, symlink.target().as_str().as_bytes());
+            }
+            ActionDirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(symlink)) => {
+                state.write(&[3]);
+                write_bytes(state, symlink.target_str().as_bytes());
+                write_bytes(state, symlink.remaining_path().as_str().as_bytes());
+            }
+        }
+        match &self.deps {
+            Some(deps) => {
+                state.write(&[1]);
+                write_digest(state, deps.fingerprint().data());
+            }
+            None => state.write(&[0]),
+        }
+        match &self.content_based_path_hash {
+            UnderlyingContentBasedPathHash::Inferred => state.write(&[0]),
+            UnderlyingContentBasedPathHash::Explicit(content_hash) => {
+                state.write(&[1]);
+                match content_hash.as_ref() {
+                    ContentBasedPathHash::Specified(value) => {
+                        state.write(&[0]);
+                        write_bytes(state, value.as_bytes());
+                    }
+                    ContentBasedPathHash::OutputArtifact => state.write(&[1]),
+                    ContentBasedPathHash::AqueryPlaceholder => state.write(&[2]),
+                    ContentBasedPathHash::Scratch => state.write(&[3]),
+                    ContentBasedPathHash::RelativePathResolution => state.write(&[4]),
+                    ContentBasedPathHash::DepFilesPlaceholder => state.write(&[5]),
+                }
+            }
+        }
+    }
 }
 
 impl ArtifactValue {
@@ -132,6 +226,17 @@ impl ArtifactValue {
         }
     }
 
+    /// Distinguishes producer-supplied path identity from hashes inferred from artifact contents.
+    ///
+    /// Persistence must preserve this distinction so reloaded artifacts retain the producer's
+    /// path semantics instead of freezing a transient inference as explicit state.
+    pub fn explicit_content_based_path_hash(&self) -> Option<&ContentBasedPathHash> {
+        match &self.content_based_path_hash {
+            UnderlyingContentBasedPathHash::Inferred => None,
+            UnderlyingContentBasedPathHash::Explicit(hash) => Some(hash),
+        }
+    }
+
     pub fn content_based_path_hash(&self) -> ContentBasedPathHash {
         if let UnderlyingContentBasedPathHash::Explicit(hash) = &self.content_based_path_hash {
             return (**hash).clone();
@@ -156,5 +261,48 @@ impl ArtifactValue {
             }
         }
         .expect("Constructed valid content-based path hash")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_common::cas_digest::CasDigestConfig;
+    use buck2_common::cas_digest::DigestAlgorithmFamily;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+
+    use super::*;
+
+    #[test]
+    fn persistent_fingerprint_distinguishes_values_with_the_same_path_hash() {
+        let digest_config = CasDigestConfig::testing_default();
+        let mut first_digest = [0; 20];
+        first_digest[8] = 1;
+        let mut second_digest = [0; 20];
+        second_digest[8] = 2;
+        let first = ArtifactValue::file(FileMetadata {
+            digest: TrackedFileDigest::new(
+                FileDigest::from_digest_bytes(DigestAlgorithmFamily::Sha1, &first_digest, 1)
+                    .unwrap(),
+                digest_config,
+            ),
+            is_executable: false,
+        });
+        let second = ArtifactValue::file(FileMetadata {
+            digest: TrackedFileDigest::new(
+                FileDigest::from_digest_bytes(DigestAlgorithmFamily::Sha1, &second_digest, 1)
+                    .unwrap(),
+                digest_config,
+            ),
+            is_executable: false,
+        });
+
+        assert_eq!(
+            first.content_based_path_hash(),
+            second.content_based_path_hash()
+        );
+        assert_ne!(
+            ArtifactValueFingerprint::from(&first),
+            ArtifactValueFingerprint::from(&second)
+        );
     }
 }

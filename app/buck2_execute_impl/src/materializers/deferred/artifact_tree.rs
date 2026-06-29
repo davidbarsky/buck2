@@ -13,12 +13,14 @@ use std::sync::Arc;
 use allocative::Allocative;
 use allocative::Visitor;
 use allocative::ident_key;
+use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
 use buck2_directory::directory::directory_ref::DirectoryRef;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryEntry;
 use buck2_execute::directory::ActionDirectoryMember;
@@ -72,12 +74,29 @@ pub struct Version(pub u64);
 pub struct ArtifactMaterializationData {
     /// Taken from `deps` of `ArtifactValue`. Used to materialize deps of the artifact.
     pub(crate) deps: Option<ActionSharedDirectory>,
+    pub(crate) content_based_path_hash: Option<ContentBasedPathHash>,
     pub(crate) stage: ArtifactMaterializationStage,
     /// An optional future that may be processing something at the current path
     /// (for example, materializing or deleting). Any other future that needs to process
     /// this path would need to wait on the existing future to finish.
     /// TODO(scottcao): Turn this into a queue of pending futures.
     pub(crate) processing: Processing,
+}
+
+impl ArtifactMaterializationData {
+    pub(crate) fn artifact_value(&self) -> ArtifactValue {
+        let entry = match &self.stage {
+            ArtifactMaterializationStage::Declared { entry, .. } => entry.dupe(),
+            ArtifactMaterializationStage::Materialized { metadata, .. } => metadata.dupe(),
+        };
+        let value = ArtifactValue::new(entry, self.deps.dupe());
+        match &self.content_based_path_hash {
+            Some(content_based_path_hash) => {
+                value.with_content_based_path_hash(content_based_path_hash.clone())
+            }
+            None => value,
+        }
+    }
 }
 
 /// Represents a processing future + the version at which it was issued. When receiving
@@ -149,12 +168,11 @@ pub(crate) fn artifact_metadata_matches_entry(
         (DirectoryEntry::Leaf(l1), DirectoryEntry::Leaf(l2)) => {
             // In Windows, the 'executable bit' absence can cause Buck2 to re-download identical artifacts.
             // To avoid this, we exclude the executable bit from the comparison.
-            if cfg!(windows) {
-                if let (ActionDirectoryMember::File(meta1), ActionDirectoryMember::File(meta2)) =
+            if cfg!(windows)
+                && let (ActionDirectoryMember::File(meta1), ActionDirectoryMember::File(meta2)) =
                     (l1, l2)
-                {
-                    return meta1.digest == meta2.digest;
-                }
+            {
+                return meta1.digest == meta2.digest;
             }
             l1 == l2
         }
@@ -288,13 +306,15 @@ impl ArtifactTree {
             for entry in sqlite_state.into_iter() {
                 let MaterializerStateEntry {
                     path,
-                    metadata,
+                    value,
                     last_access_time,
                 } = entry;
+                let metadata = value.entry().dupe();
                 tree.insert(
                     path.iter().map(|f| f.to_owned()),
                     Box::new(ArtifactMaterializationData {
-                        deps: None,
+                        deps: value.deps().map(Dupe::dupe),
+                        content_based_path_hash: value.explicit_content_based_path_hash().cloned(),
                         stage: ArtifactMaterializationStage::Materialized {
                             metadata,
                             last_access_time,
@@ -462,7 +482,9 @@ impl ArtifactTree {
         // number.
         if let Some(sqlite_db) = sqlite_db {
             sqlite_db
-                .materializer_state_table()
+                .tables
+                .domain_table
+                .materializer_state
                 .delete(invalidated_paths)
                 .buck_error_context("Error invalidating paths in materializer state")?;
         }
