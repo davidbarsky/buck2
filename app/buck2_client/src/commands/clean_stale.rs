@@ -97,6 +97,18 @@ fn format_result_stats(stats: buck2_data::CleanStaleStats) -> String {
             bytesize::ByteSize::b(stats.cleaned_bytes).display().iec(),
         );
     }
+    if stats.stale_persistent_action_reuse_entry_count > 0
+        || stats.cleaned_persistent_action_reuse_entry_count > 0
+    {
+        output += &format!(
+            "Found {} stale persistent action-reuse entries\n",
+            stats.stale_persistent_action_reuse_entry_count,
+        );
+        output += &format!(
+            "Cleaned {} persistent action-reuse entries\n",
+            stats.cleaned_persistent_action_reuse_entry_count,
+        );
+    }
     output
 }
 
