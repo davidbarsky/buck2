@@ -1,0 +1,32 @@
+load(":defs.bzl", "dep_file", "identical", "incremental", "incremental_dep_file", "incremental_downstream", "incremental_stable", "invocation_ids", "metadata_dep_file")
+
+identical(name = "identical")
+
+invocation_ids(name = "invocation_ids")
+
+incremental(name = "incremental")
+
+incremental_stable(name = "incremental_stable")
+
+incremental_downstream(
+    name = "incremental_downstream",
+    input = ":incremental_stable",
+)
+
+incremental_dep_file(
+    name = "incremental_dep_file",
+    unused = "unused.txt",
+    used = "used.txt",
+)
+
+metadata_dep_file(
+    name = "metadata_dep_file",
+    metadata_input = "metadata_input.txt",
+    unused = "unused.txt",
+)
+
+dep_file(
+    name = "dep_file",
+    unused = "unused.txt",
+    used = "used.txt",
+)
