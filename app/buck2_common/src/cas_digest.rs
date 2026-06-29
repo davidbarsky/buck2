@@ -404,6 +404,11 @@ impl DataDigester {
         self.size += data.len() as u64;
     }
 
+    pub fn update_length_prefixed(&mut self, data: &[u8]) {
+        self.update(&(data.len() as u64).to_le_bytes());
+        self.update(data);
+    }
+
     pub fn finalize(self) -> CasDigestData {
         match self.variant {
             DigesterVariant::Sha1(h) => CasDigestData::new_sha1(h.finalize().into(), self.size),
@@ -514,6 +519,10 @@ impl CasDigestData {
 
     pub fn raw_digest(&self) -> &RawDigest {
         &self.digest
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 

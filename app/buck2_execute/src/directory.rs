@@ -169,7 +169,7 @@ impl ReDirectorySerializer {
                         }
                         target.as_str().to_owned()
                     } else {
-                        s.to_string()
+                        s.target().as_str().to_owned()
                     };
                     symlinks.push(RE::SymlinkNode {
                         name: name.as_str().into(),

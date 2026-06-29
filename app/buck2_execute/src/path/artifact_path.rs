@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;
+use std::hash::Hasher;
 
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -23,6 +24,7 @@ use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use either::Either;
 use gazebo::cell::ARef;
+use strong_hash::StrongHash;
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct ArtifactPath<'a> {
@@ -31,6 +33,29 @@ pub struct ArtifactPath<'a> {
     /// The number of components at the prefix of that path that are internal details to the rule,
     /// not returned by `.short_path`.
     pub hidden_components_count: usize,
+}
+
+impl StrongHash for ArtifactPath<'_> {
+    fn strong_hash<H: Hasher>(&self, state: &mut H) {
+        let ArtifactPath {
+            base_path,
+            projected_path,
+            hidden_components_count,
+        } = self;
+        match base_path.as_ref() {
+            Either::Left(build) => {
+                state.write_u8(0);
+                build.strong_hash(state);
+            }
+            Either::Right(source) => {
+                state.write_u8(1);
+                source.package().strong_hash(state);
+                source.path().strong_hash(state);
+            }
+        }
+        projected_path.strong_hash(state);
+        hidden_components_count.strong_hash(state);
+    }
 }
 
 impl ArtifactPath<'_> {

@@ -48,7 +48,12 @@ use buck2_execute::entry::build_entry_from_disk;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
+use buck2_execute::execute::environment_inheritance::Buck2DaemonUuid;
+use buck2_execute::execute::environment_inheritance::BuckBuildId;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+use buck2_execute::execute::environment_inheritance::LocalEnvironmentDirective;
+use buck2_execute::execute::environment_inheritance::LocalExecutionIdentity;
+use buck2_execute::execute::environment_inheritance::visit_local_execution_environment;
 use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::inputs_directory::inputs_directory;
 use buck2_execute::execute::kind::CommandExecutionKind;
@@ -622,7 +627,10 @@ impl LocalExecutor {
                 );
             }
         };
-        let build_id: &str = &dispatcher.trace_id().to_string();
+        let local_execution_identity = LocalExecutionIdentity {
+            buck_build_id: BuckBuildId(dispatcher.trace_id().to_string()),
+            buck2_daemon_uuid: Buck2DaemonUuid(self.daemon_id.to_string()),
+        };
 
         let mut env = vec![];
 
@@ -665,9 +673,11 @@ impl LocalExecutor {
                 )
             })
         }));
-        let daemon_id = self.daemon_id.to_string();
-        env.push(("BUCK2_DAEMON_UUID", StrOrOsStr::from(&*daemon_id)));
-        env.push(("BUCK_BUILD_ID", StrOrOsStr::from(build_id)));
+        env.extend(
+            (&local_execution_identity)
+                .into_iter()
+                .map(|(key, value)| (key, StrOrOsStr::from(value))),
+        );
 
         let liveliness_observer = manager.inner.liveliness_observer.dupe().and(cancellation);
 
@@ -1407,9 +1417,7 @@ pub async fn materialize_inputs(
                 }
             }
             CommandExecutionInput::ActionMetadata(metadata) => {
-                let path = artifact_fs
-                    .buck_out_path_resolver()
-                    .resolve_gen(&metadata.path, Some(&metadata.content_hash))?;
+                let path = metadata.resolve_path(artifact_fs)?;
                 paths.push(path);
             }
             CommandExecutionInput::ScratchPath(path) => {
@@ -1621,32 +1629,22 @@ pub async fn create_output_dirs(
 pub fn apply_local_execution_environment(
     builder: &mut impl EnvironmentBuilder,
     working_directory: &AbsPath,
-    env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
-    env_inheritance: Option<&EnvironmentInheritance>,
+    environment: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
+    inheritance: Option<&EnvironmentInheritance>,
 ) {
-    if let Some(env_inheritance) = env_inheritance {
-        if env_inheritance.clear() {
-            builder.clear();
+    visit_local_execution_environment(working_directory, environment, inheritance, |directive| {
+        match directive {
+            LocalEnvironmentDirective::Clear => builder.clear(),
+            LocalEnvironmentDirective::Remove(key) => builder.remove(key),
+            LocalEnvironmentDirective::Set { key, value } => builder.set(key, value),
         }
-
-        for key in env_inheritance.exclusions() {
-            builder.remove(key);
-        }
-
-        for (key, val) in env_inheritance.values() {
-            builder.set(key, val);
-        }
-    }
-    for (key, val) in env {
-        builder.set(key, val);
-    }
-    builder.set("PWD", working_directory.as_path());
+    });
 }
 
 pub trait EnvironmentBuilder {
     fn clear(&mut self);
 
-    fn set<K, V>(&mut self, key: K, val: V)
+    fn set<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>;

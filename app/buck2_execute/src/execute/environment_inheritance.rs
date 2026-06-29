@@ -8,10 +8,41 @@
  * above-listed licenses.
  */
 
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
+use buck2_fs::paths::abs_path::AbsPath;
 use dupe::Dupe;
+
+pub const BUCK_BUILD_ID: &str = "BUCK_BUILD_ID";
+pub const BUCK2_DAEMON_UUID: &str = "BUCK2_DAEMON_UUID";
+
+/// Invocation identity injected after the action's declared and inherited environment.
+#[derive(Debug, Eq, PartialEq)]
+pub struct LocalExecutionIdentity {
+    pub buck_build_id: BuckBuildId,
+    pub buck2_daemon_uuid: Buck2DaemonUuid,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct BuckBuildId(pub String);
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Buck2DaemonUuid(pub String);
+
+impl<'a> IntoIterator for &'a LocalExecutionIdentity {
+    type Item = (&'static str, &'a str);
+    type IntoIter = std::array::IntoIter<Self::Item, 2>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        [
+            (BUCK_BUILD_ID, self.buck_build_id.0.as_str()),
+            (BUCK2_DAEMON_UUID, self.buck2_daemon_uuid.0.as_str()),
+        ]
+        .into_iter()
+    }
+}
 
 #[cfg(fbcode_build)]
 const ENV_ALLOW_LIST: &[&str] = test_env_allowlist::LEGACY_TESTPILOT_ALLOW_LIST;
@@ -137,4 +168,46 @@ impl EnvironmentInheritance {
     pub fn clear(&self) -> bool {
         self.clear
     }
+}
+
+/// Visits directives in execution order so execution and reuse hashing see the same environment.
+pub fn visit_local_execution_environment(
+    working_directory: &AbsPath,
+    environment: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
+    inheritance: Option<&EnvironmentInheritance>,
+    mut visit: impl FnMut(LocalEnvironmentDirective<'_>),
+) {
+    if let Some(inheritance) = inheritance {
+        if inheritance.clear() {
+            visit(LocalEnvironmentDirective::Clear);
+        }
+
+        for key in inheritance.exclusions() {
+            visit(LocalEnvironmentDirective::Remove(OsStr::new(key)));
+        }
+
+        for (key, value) in inheritance.values() {
+            visit(LocalEnvironmentDirective::Set {
+                key: OsStr::new(key),
+                value,
+            });
+        }
+    }
+    for (key, value) in environment {
+        visit(LocalEnvironmentDirective::Set {
+            key: key.as_ref(),
+            value: value.as_ref(),
+        });
+    }
+    visit(LocalEnvironmentDirective::Set {
+        key: OsStr::new("PWD"),
+        value: working_directory.as_os_str(),
+    });
+}
+
+/// Decouples environment reuse hashing from any particular process builder.
+pub enum LocalEnvironmentDirective<'a> {
+    Clear,
+    Remove(&'a OsStr),
+    Set { key: &'a OsStr, value: &'a OsStr },
 }

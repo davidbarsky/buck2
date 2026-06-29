@@ -8,10 +8,13 @@
  * above-listed licenses.
  */
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
 use allocative::Allocative;
+use buck2_common::cas_digest::CasDigestData;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::local_resource_state::LocalResourceState;
 use buck2_core::content_hash::ContentBasedPathHash;
@@ -32,6 +35,7 @@ use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::buck2_error;
+use buck2_fs::paths::abs_path::AbsPath;
 use buck2_hash::BuckIndexSet;
 use derive_more::Display;
 use dupe::Dupe;
@@ -51,7 +55,18 @@ use crate::directory::ActionDirectoryEntry;
 use crate::directory::ActionDirectoryMember;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ActionSharedDirectory;
+#[cfg(test)]
+use crate::execute::environment_inheritance::BUCK_BUILD_ID;
+#[cfg(test)]
+use crate::execute::environment_inheritance::BUCK2_DAEMON_UUID;
+#[cfg(test)]
+use crate::execute::environment_inheritance::Buck2DaemonUuid;
+#[cfg(test)]
+use crate::execute::environment_inheritance::BuckBuildId;
 use crate::execute::environment_inheritance::EnvironmentInheritance;
+use crate::execute::environment_inheritance::LocalEnvironmentDirective;
+use crate::execute::environment_inheritance::LocalExecutionIdentity;
+use crate::execute::environment_inheritance::visit_local_execution_environment;
 use crate::execute::inputs_directory::inputs_directory;
 
 /// What protobuf messages can be stored in the action metadata blobs.
@@ -84,6 +99,14 @@ pub struct ActionMetadataBlob {
     pub content_hash: ContentBasedPathHash,
 }
 
+impl ActionMetadataBlob {
+    /// Keeps the metadata's content hash coupled to every resolution of its output path.
+    pub fn resolve_path(&self, fs: &ArtifactFs) -> buck2_error::Result<ProjectRelativePathBuf> {
+        fs.buck_out_path_resolver()
+            .resolve_gen(&self.path, Some(&self.content_hash))
+    }
+}
+
 pub enum CommandExecutionInput {
     Artifact(Box<dyn ArtifactGroupValuesDyn>),
     ActionMetadata(ActionMetadataBlob),
@@ -92,6 +115,33 @@ pub enum CommandExecutionInput {
         ProjectRelativePathBuf,
         ActionDirectoryEntry<ActionSharedDirectory>,
     ),
+}
+
+/// Context safe to reuse while daemon-owned execution state remains alive.
+#[derive(Allocative, Clone, Dupe, Eq, PartialEq)]
+pub struct InDaemonLocalReuseKey(CasDigestData);
+
+/// Context safe to reuse after daemon-owned execution state is gone.
+#[derive(Allocative, Clone, Dupe, Eq, PartialEq)]
+pub struct PersistentLocalReuseKey(CasDigestData);
+
+impl AsRef<CasDigestData> for PersistentLocalReuseKey {
+    fn as_ref(&self) -> &CasDigestData {
+        &self.0
+    }
+}
+
+/// Carries both scopes together so persistent gating cannot disable in-daemon reuse.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LocalReuseKeys {
+    pub in_daemon: InDaemonLocalReuseKey,
+    pub persistent: Option<PersistentLocalReuseKey>,
+}
+
+#[derive(Copy, Clone, Dupe, Eq, PartialEq)]
+pub enum PersistentLocalReuseEligibility {
+    Eligible,
+    Ineligible,
 }
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone, Dupe, Hash)]
@@ -371,6 +421,7 @@ pub struct CommandExecutionRequest {
     pub outputs_cleanup: bool,
     /// What environment variables to inherit from the Buck2 daemon.
     local_environment_inheritance: Option<EnvironmentInheritance>,
+    /// Values local execution injects after the declared and inherited environment.
     /// Whether this command should override the fallback-only behavior on an hybrid executor and
     /// thus always run as if the executor was full-hybrid, assuming it is capable.
     force_full_hybrid_if_capable: bool,
@@ -611,6 +662,79 @@ impl CommandExecutionRequest {
         self.local_environment_inheritance.as_ref()
     }
 
+    /// Keeps invocation identity in daemon-local keys while stable keys rely on cache eligibility.
+    pub fn local_reuse_keys(
+        &self,
+        digest_config: DigestConfig,
+        fs: &ArtifactFs,
+        local_execution_identity: &LocalExecutionIdentity,
+        prepared_network_access: Option<NetworkAccess>,
+        persistent_eligibility: PersistentLocalReuseEligibility,
+    ) -> buck2_error::Result<LocalReuseKeys> {
+        let restricted_network = match prepared_network_access {
+            None | Some(NetworkAccess::All) => false,
+            Some(
+                NetworkAccess::None
+                | NetworkAccess::Loopback
+                | NetworkAccess::Strict
+                | NetworkAccess::Private,
+            ) => !self.disable_local_network_isolation,
+        };
+        let persistent = persistent_eligibility == PersistentLocalReuseEligibility::Eligible
+            && self.outputs_cleanup
+            && self.worker.is_none()
+            && self.remote_worker.is_none()
+            && self.required_local_resources.is_empty()
+            && !self.executor_preference.requires_remote()
+            && !restricted_network;
+
+        let mut digester = CasDigestData::digester(digest_config.cas_digest_config());
+        digester.update(b"local-reuse-context-v1");
+        digester.update(&[u8::from(self.unique_input_inodes)]);
+
+        for input in self.inputs() {
+            match input {
+                CommandExecutionInput::ActionMetadata(metadata) => {
+                    digester.update(&[1]);
+                    let path = metadata.resolve_path(fs)?;
+                    digester.update_length_prefixed(path.as_str().as_bytes());
+                    digester.update(&[metadata.digest.raw_digest().algorithm() as u8]);
+                    digester.update_length_prefixed(metadata.digest.raw_digest().as_bytes());
+                    digester.update(&metadata.digest.size().to_le_bytes());
+                }
+                CommandExecutionInput::ScratchPath(scratch_path) => {
+                    digester.update(&[2]);
+                    let scratch_path = fs.buck_out_path_resolver().resolve_scratch(scratch_path)?;
+                    digester.update_length_prefixed(scratch_path.as_str().as_bytes());
+                }
+                CommandExecutionInput::Artifact(..)
+                | CommandExecutionInput::IncrementalRemoteOutput(..) => {}
+            }
+        }
+
+        match self.timeout {
+            Some(timeout) => {
+                digester.update(&[1]);
+                digester.update(&timeout.as_secs().to_le_bytes());
+                digester.update(&timeout.subsec_nanos().to_le_bytes());
+            }
+            None => digester.update(&[0]),
+        }
+        let working_directory = fs.fs().resolve(self.working_directory());
+        Ok(self.local_reuse_keys_from_environment(
+            std::env::vars_os().collect(),
+            local_execution_identity,
+            &working_directory,
+            digester.finalize(),
+            digest_config,
+            if persistent {
+                PersistentLocalReuseEligibility::Eligible
+            } else {
+                PersistentLocalReuseEligibility::Ineligible
+            },
+        ))
+    }
+
     pub fn with_force_full_hybrid_if_capable(mut self, force_full_hybrid_if_capable: bool) -> Self {
         self.force_full_hybrid_if_capable = force_full_hybrid_if_capable;
         self
@@ -757,6 +881,727 @@ impl CommandExecutionRequest {
 
     pub fn disable_local_network_isolation(&self) -> bool {
         self.disable_local_network_isolation
+    }
+
+    fn local_reuse_keys_from_environment(
+        &self,
+        mut environment: BTreeMap<OsString, OsString>,
+        local_execution_identity: &LocalExecutionIdentity,
+        working_directory: &AbsPath,
+        local_reuse_context: CasDigestData,
+        digest_config: DigestConfig,
+        persistent_eligibility: PersistentLocalReuseEligibility,
+    ) -> LocalReuseKeys {
+        visit_local_execution_environment(
+            working_directory,
+            self.env.iter(),
+            self.local_environment_inheritance(),
+            |directive| match directive {
+                LocalEnvironmentDirective::Clear => environment.clear(),
+                LocalEnvironmentDirective::Remove(key) => {
+                    environment.remove(key);
+                }
+                LocalEnvironmentDirective::Set { key, value } => {
+                    environment.insert(key.to_owned(), value.to_owned());
+                }
+            },
+        );
+        let digest_environment = |domain: &[u8], environment: &BTreeMap<OsString, OsString>| {
+            let mut digester = CasDigestData::digester(digest_config.cas_digest_config());
+            digester.update(domain);
+            digester.update(&[local_reuse_context.raw_digest().algorithm() as u8]);
+            digester.update_length_prefixed(local_reuse_context.raw_digest().as_bytes());
+            digester.update(&local_reuse_context.size().to_le_bytes());
+            digester.update(&(environment.len() as u64).to_le_bytes());
+            for (key, value) in environment {
+                digester.update_length_prefixed(key.as_os_str().as_encoded_bytes());
+                digester.update_length_prefixed(value.as_os_str().as_encoded_bytes());
+            }
+            digester.finalize()
+        };
+        let persistent = match persistent_eligibility {
+            PersistentLocalReuseEligibility::Eligible => Some(PersistentLocalReuseKey(
+                digest_environment(b"persistent-local-reuse-key-v1", &environment),
+            )),
+            PersistentLocalReuseEligibility::Ineligible => None,
+        };
+        for (key, value) in local_execution_identity {
+            environment.insert(key.into(), value.into());
+        }
+        LocalReuseKeys {
+            in_daemon: InDaemonLocalReuseKey(digest_environment(
+                b"in-daemon-local-reuse-key-v1",
+                &environment,
+            )),
+            persistent,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_common::local_resource_state::LocalResourceState;
+    use buck2_core::category::CategoryRef;
+    use buck2_core::cells::CellResolver;
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::content_hash::ContentBasedPathHash;
+    use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+    use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+    use buck2_core::fs::buck_out_path::BuckOutPathKind;
+    use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+    use buck2_core::fs::buck_out_path::BuckOutScratchPath;
+    use buck2_core::fs::buck_out_path::BuildArtifactPath;
+    use buck2_core::fs::project::ProjectRoot;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+    use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+    use buck2_fs::paths::abs_path::AbsPath;
+    use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+    use buck2_hash::BuckIndexSet;
+    use dupe::Dupe;
+    use sorted_vector_map::SortedVectorMap;
+
+    use super::*;
+
+    struct LocalReuseRequestFixture {
+        fs: ArtifactFs,
+        digest_config: DigestConfig,
+        local_execution_identity: LocalExecutionIdentity,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScratchPathIdentity {
+        ActionKey,
+        ContentHash,
+    }
+
+    #[derive(Clone, Copy)]
+    struct LocalReuseRequestConfig<'a> {
+        metadata: &'a [u8],
+        metadata_path: &'a str,
+        scratch_identifier: &'a str,
+        scratch_action_key: &'a str,
+        scratch_path_identity: ScratchPathIdentity,
+    }
+
+    impl LocalReuseRequestFixture {
+        fn new() -> Self {
+            let fs = ArtifactFs::new(
+                CellResolver::testing_with_name_and_path(
+                    CellName::testing_new("root"),
+                    CellRootPathBuf::testing_new(""),
+                ),
+                BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new(
+                    "buck-out/v2".into(),
+                )),
+                ProjectRoot::new_unchecked(
+                    AbsNormPathBuf::new(
+                        Path::new(if cfg!(windows) {
+                            "C:\\local-reuse-test"
+                        } else {
+                            "/local-reuse-test"
+                        })
+                        .to_owned(),
+                    )
+                    .unwrap(),
+                ),
+            );
+            Self {
+                fs,
+                digest_config: DigestConfig::testing_default(),
+                local_execution_identity: LocalExecutionIdentity {
+                    buck_build_id: BuckBuildId("build-id".to_owned()),
+                    buck2_daemon_uuid: Buck2DaemonUuid("daemon-id".to_owned()),
+                },
+            }
+        }
+
+        fn request(&self, config: LocalReuseRequestConfig<'_>) -> CommandExecutionRequest {
+            let LocalReuseRequestConfig {
+                metadata,
+                metadata_path,
+                scratch_identifier,
+                scratch_action_key,
+                scratch_path_identity,
+            } = config;
+            let owner = BaseDeferredKey::TargetLabel(ConfiguredTargetLabel::testing_parse(
+                "root//pkg:target",
+                ConfigurationData::testing_new(),
+            ));
+            let metadata_digest =
+                TrackedFileDigest::from_content(metadata, self.digest_config.cas_digest_config());
+            let paths = CommandExecutionPaths::new(
+                vec![
+                    CommandExecutionInput::ActionMetadata(ActionMetadataBlob {
+                        digest: metadata_digest.dupe(),
+                        path: BuildArtifactPath::new(
+                            owner.dupe(),
+                            ForwardRelativePathBuf::unchecked_new(metadata_path.into()),
+                            BuckOutPathKind::Configuration,
+                        ),
+                        content_hash: ContentBasedPathHash::new(
+                            metadata_digest.raw_digest().as_bytes(),
+                        )
+                        .unwrap(),
+                    }),
+                    CommandExecutionInput::ScratchPath(
+                        BuckOutScratchPath::new(
+                            owner,
+                            CategoryRef::new("local_reuse").unwrap(),
+                            Some(scratch_identifier),
+                            ForwardRelativePathBuf::unchecked_new(scratch_action_key.into()),
+                            match scratch_path_identity {
+                                ScratchPathIdentity::ActionKey => false,
+                                ScratchPathIdentity::ContentHash => true,
+                            },
+                        )
+                        .unwrap(),
+                    ),
+                ],
+                BuckIndexSet::new(),
+                &self.fs,
+                self.digest_config,
+                None,
+            )
+            .unwrap();
+            CommandExecutionRequest::new(Vec::new(), Vec::new(), paths, SortedVectorMap::new())
+        }
+    }
+
+    #[test]
+    fn local_reuse_key_tracks_request_context_and_gates_unsafe_requests() {
+        let value = u64::MAX;
+        let next_value = value.wrapping_add(1);
+        let fixture = LocalReuseRequestFixture::new();
+        let metadata = value.to_le_bytes();
+        let baseline_config = LocalReuseRequestConfig {
+            metadata: &metadata,
+            metadata_path: "metadata.json",
+            scratch_identifier: "scratch-id",
+            scratch_action_key: "scratch",
+            scratch_path_identity: ScratchPathIdentity::ActionKey,
+        };
+        let baseline = fixture.request(baseline_config);
+        let baseline_key = baseline
+            .local_reuse_keys(
+                fixture.digest_config,
+                &fixture.fs,
+                &fixture.local_execution_identity,
+                None,
+                PersistentLocalReuseEligibility::Eligible,
+            )
+            .unwrap();
+        let ineligible_key = baseline
+            .local_reuse_keys(
+                fixture.digest_config,
+                &fixture.fs,
+                &fixture.local_execution_identity,
+                None,
+                PersistentLocalReuseEligibility::Ineligible,
+            )
+            .unwrap();
+        assert!(ineligible_key.persistent.is_none());
+        assert!(ineligible_key.in_daemon == baseline_key.in_daemon);
+
+        assert!(
+            baseline_key
+                == fixture
+                    .request(baseline_config)
+                    .with_executor_preference(ExecutorPreference::LocalRequired)
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                == fixture
+                    .request(baseline_config)
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        Some(NetworkAccess::All),
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(LocalReuseRequestConfig {
+                        metadata: &next_value.to_le_bytes(),
+                        ..baseline_config
+                    })
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(LocalReuseRequestConfig {
+                        metadata_path: "other-metadata.json",
+                        ..baseline_config
+                    })
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(LocalReuseRequestConfig {
+                        scratch_identifier: "other-scratch-id",
+                        ..baseline_config
+                    })
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(LocalReuseRequestConfig {
+                        scratch_action_key: "other-scratch",
+                        ..baseline_config
+                    })
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(LocalReuseRequestConfig {
+                        scratch_path_identity: ScratchPathIdentity::ContentHash,
+                        ..baseline_config
+                    })
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(baseline_config)
+                    .with_timeout(Duration::from_secs(value % 60 + 1))
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(baseline_config)
+                    .with_working_directory(ProjectRelativePathBuf::unchecked_new("subdir".into()))
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+        assert!(
+            baseline_key
+                != fixture
+                    .request(baseline_config)
+                    .with_unique_input_inodes(true)
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        None,
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+
+        let excluded = fixture
+            .request(baseline_config)
+            .with_outputs_cleanup(false)
+            .local_reuse_keys(
+                fixture.digest_config,
+                &fixture.fs,
+                &fixture.local_execution_identity,
+                None,
+                PersistentLocalReuseEligibility::Eligible,
+            )
+            .unwrap();
+        assert!(excluded.persistent.is_none());
+        assert!(
+            fixture
+                .request(baseline_config)
+                .with_worker(Some(WorkerSpec {
+                    id: WorkerId(1),
+                    exe: Vec::new(),
+                    env: SortedVectorMap::new(),
+                    concurrency: None,
+                    streaming: false,
+                    remote_key: None,
+                    input_paths: CommandExecutionPaths::new(
+                        Vec::new(),
+                        BuckIndexSet::new(),
+                        &fixture.fs,
+                        fixture.digest_config,
+                        None,
+                    )
+                    .unwrap(),
+                }))
+                .local_reuse_keys(
+                    fixture.digest_config,
+                    &fixture.fs,
+                    &fixture.local_execution_identity,
+                    None,
+                    PersistentLocalReuseEligibility::Eligible
+                )
+                .unwrap()
+                .persistent
+                .is_none()
+        );
+        assert!(
+            fixture
+                .request(baseline_config)
+                .with_remote_worker(Some(RemoteWorkerSpec {
+                    id: WorkerId(1),
+                    init: Vec::new(),
+                    env: SortedVectorMap::new(),
+                    input_paths: CommandExecutionPaths::new(
+                        Vec::new(),
+                        BuckIndexSet::new(),
+                        &fixture.fs,
+                        fixture.digest_config,
+                        None,
+                    )
+                    .unwrap(),
+                    concurrency: None,
+                }))
+                .local_reuse_keys(
+                    fixture.digest_config,
+                    &fixture.fs,
+                    &fixture.local_execution_identity,
+                    None,
+                    PersistentLocalReuseEligibility::Eligible
+                )
+                .unwrap()
+                .persistent
+                .is_none()
+        );
+        assert!(
+            fixture
+                .request(baseline_config)
+                .with_required_local_resources(vec![LocalResourceState::new(
+                    ConfiguredTargetLabel::testing_parse(
+                        "root//pkg:resource",
+                        ConfigurationData::testing_new(),
+                    ),
+                    None,
+                    Vec::new(),
+                )])
+                .unwrap()
+                .local_reuse_keys(
+                    fixture.digest_config,
+                    &fixture.fs,
+                    &fixture.local_execution_identity,
+                    None,
+                    PersistentLocalReuseEligibility::Eligible
+                )
+                .unwrap()
+                .persistent
+                .is_none()
+        );
+        assert!(
+            fixture
+                .request(baseline_config)
+                .with_executor_preference(ExecutorPreference::RemoteRequired)
+                .local_reuse_keys(
+                    fixture.digest_config,
+                    &fixture.fs,
+                    &fixture.local_execution_identity,
+                    None,
+                    PersistentLocalReuseEligibility::Eligible
+                )
+                .unwrap()
+                .persistent
+                .is_none()
+        );
+
+        for network_access in [
+            NetworkAccess::None,
+            NetworkAccess::Loopback,
+            NetworkAccess::Strict,
+            NetworkAccess::Private,
+        ] {
+            assert!(
+                fixture
+                    .request(baseline_config)
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        Some(network_access),
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+                    .persistent
+                    .is_none()
+            );
+        }
+        assert!(
+            baseline_key
+                == fixture
+                    .request(baseline_config)
+                    .with_disable_local_network_isolation(true)
+                    .local_reuse_keys(
+                        fixture.digest_config,
+                        &fixture.fs,
+                        &fixture.local_execution_identity,
+                        Some(NetworkAccess::Private),
+                        PersistentLocalReuseEligibility::Eligible
+                    )
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_reuse_key_tracks_effective_environment() {
+        let value = u64::MAX;
+        let next_value = value.wrapping_add(1);
+        let fixture = LocalReuseRequestFixture::new();
+        let digest_config = fixture.digest_config;
+        let working_directory_path = std::env::temp_dir().join("persistent-action-reuse-context");
+        let working_directory = AbsPath::new(&working_directory_path).unwrap();
+        let request_environment =
+            SortedVectorMap::from_iter([("EXPLICIT".to_owned(), format!("explicit-{value}"))]);
+        let metadata = value.to_le_bytes();
+        let mut request = fixture.request(LocalReuseRequestConfig {
+            metadata: &metadata,
+            metadata_path: "metadata.json",
+            scratch_identifier: "scratch-id",
+            scratch_action_key: "scratch",
+            scratch_path_identity: ScratchPathIdentity::ActionKey,
+        });
+        request.env = request_environment;
+        request.local_environment_inheritance =
+            Some(EnvironmentInheritance::local_command_exclusions());
+        let environment: BTreeMap<OsString, OsString> = [
+            ("PATH", format!("path-{value}")),
+            ("PYTHONPATH", format!("ignored-{value}")),
+            ("INHERITED", format!("inherited-{value}")),
+            (BUCK_BUILD_ID, "shadowed-build-id".to_owned()),
+            (BUCK2_DAEMON_UUID, "shadowed-daemon-id".to_owned()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect();
+        let mut local_reuse_context = CasDigestData::digester(digest_config.cas_digest_config());
+        local_reuse_context.update(&value.to_le_bytes());
+        let local_reuse_context = local_reuse_context.finalize();
+        let local_execution_identity = LocalExecutionIdentity {
+            buck_build_id: BuckBuildId(format!("build-{value}")),
+            buck2_daemon_uuid: Buck2DaemonUuid(format!("daemon-{value}")),
+        };
+
+        let context = request.local_reuse_keys_from_environment(
+            environment.clone(),
+            &local_execution_identity,
+            working_directory,
+            local_reuse_context,
+            digest_config,
+            PersistentLocalReuseEligibility::Eligible,
+        );
+
+        let mut changed_inherited = environment.clone();
+        changed_inherited.insert(
+            OsString::from("INHERITED"),
+            OsString::from(format!("inherited-{next_value}")),
+        );
+        assert!(
+            context
+                != request.local_reuse_keys_from_environment(
+                    changed_inherited,
+                    &local_execution_identity,
+                    working_directory,
+                    local_reuse_context,
+                    digest_config,
+                    PersistentLocalReuseEligibility::Eligible,
+                )
+        );
+
+        let mut changed_excluded = environment.clone();
+        changed_excluded.insert(
+            OsString::from("PYTHONPATH"),
+            OsString::from(format!("ignored-{next_value}")),
+        );
+        assert!(
+            context
+                == request.local_reuse_keys_from_environment(
+                    changed_excluded,
+                    &local_execution_identity,
+                    working_directory,
+                    local_reuse_context,
+                    digest_config,
+                    PersistentLocalReuseEligibility::Eligible,
+                )
+        );
+
+        let changed_local_execution_identity = LocalExecutionIdentity {
+            buck_build_id: BuckBuildId(format!("build-{next_value}")),
+            buck2_daemon_uuid: Buck2DaemonUuid(format!("daemon-{next_value}")),
+        };
+        let changed_identity_context = request.local_reuse_keys_from_environment(
+            environment.clone(),
+            &changed_local_execution_identity,
+            working_directory,
+            local_reuse_context,
+            digest_config,
+            PersistentLocalReuseEligibility::Eligible,
+        );
+        assert!(context.in_daemon != changed_identity_context.in_daemon);
+        assert!(context.persistent == changed_identity_context.persistent);
+
+        let changed_request_environment =
+            SortedVectorMap::from_iter([("EXPLICIT".to_owned(), format!("explicit-{next_value}"))]);
+        let mut changed_request = fixture.request(LocalReuseRequestConfig {
+            metadata: &metadata,
+            metadata_path: "metadata.json",
+            scratch_identifier: "scratch-id",
+            scratch_action_key: "scratch",
+            scratch_path_identity: ScratchPathIdentity::ActionKey,
+        });
+        changed_request.env = changed_request_environment;
+        changed_request.local_environment_inheritance =
+            Some(EnvironmentInheritance::local_command_exclusions());
+        assert!(
+            context
+                != changed_request.local_reuse_keys_from_environment(
+                    environment.clone(),
+                    &local_execution_identity,
+                    working_directory,
+                    local_reuse_context,
+                    digest_config,
+                    PersistentLocalReuseEligibility::Eligible,
+                )
+        );
+
+        let mut changed_local_reuse_context =
+            CasDigestData::digester(digest_config.cas_digest_config());
+        changed_local_reuse_context.update(&next_value.to_le_bytes());
+        let changed_local_reuse_context = changed_local_reuse_context.finalize();
+        assert!(
+            context
+                != request.local_reuse_keys_from_environment(
+                    environment.clone(),
+                    &local_execution_identity,
+                    working_directory,
+                    changed_local_reuse_context,
+                    digest_config,
+                    PersistentLocalReuseEligibility::Eligible,
+                )
+        );
+
+        let other_working_directory_path =
+            std::env::temp_dir().join("persistent-action-reuse-context-other");
+        let other_working_directory = AbsPath::new(&other_working_directory_path).unwrap();
+        assert!(
+            context
+                != request.local_reuse_keys_from_environment(
+                    environment,
+                    &local_execution_identity,
+                    other_working_directory,
+                    local_reuse_context,
+                    digest_config,
+                    PersistentLocalReuseEligibility::Eligible,
+                )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_reuse_key_tracks_non_unicode_environment() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = LocalReuseRequestFixture::new();
+        let metadata = [0];
+        let request = fixture
+            .request(LocalReuseRequestConfig {
+                metadata: &metadata,
+                metadata_path: "metadata.json",
+                scratch_identifier: "scratch-id",
+                scratch_action_key: "scratch",
+                scratch_path_identity: ScratchPathIdentity::ActionKey,
+            })
+            .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions());
+        let working_directory_path = std::env::temp_dir();
+        let working_directory = AbsPath::new(&working_directory_path).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("NON_UNICODE"),
+            OsString::from_vec(vec![0xff]),
+        )]);
+        let local_execution_identity = LocalExecutionIdentity {
+            buck_build_id: BuckBuildId("build-id".to_owned()),
+            buck2_daemon_uuid: Buck2DaemonUuid("daemon-id".to_owned()),
+        };
+        let key = request.local_reuse_keys_from_environment(
+            environment,
+            &local_execution_identity,
+            working_directory,
+            CasDigestData::digester(DigestConfig::testing_default().cas_digest_config()).finalize(),
+            DigestConfig::testing_default(),
+            PersistentLocalReuseEligibility::Eligible,
+        );
+        let unicode_key = request.local_reuse_keys_from_environment(
+            BTreeMap::from([(OsString::from("NON_UNICODE"), OsString::from("different"))]),
+            &local_execution_identity,
+            working_directory,
+            CasDigestData::digester(DigestConfig::testing_default().cas_digest_config()).finalize(),
+            DigestConfig::testing_default(),
+            PersistentLocalReuseEligibility::Eligible,
+        );
+        assert!(key != unicode_key);
     }
 }
 
