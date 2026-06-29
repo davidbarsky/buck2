@@ -77,13 +77,17 @@ use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
+use buck2_execute::execute::environment_inheritance::Buck2DaemonUuid;
+use buck2_execute::execute::environment_inheritance::BuckBuildId;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+use buck2_execute::execute::environment_inheritance::LocalExecutionIdentity;
 use buck2_execute::execute::request::ActionMetadataBlob;
 use buck2_execute::execute::request::CommandExecutionInput;
 use buck2_execute::execute::request::CommandExecutionOutput;
 use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
+use buck2_execute::execute::request::PersistentLocalReuseEligibility;
 use buck2_execute::execute::request::RemoteWorkerSpec;
 use buck2_execute::execute::request::WorkerId;
 use buck2_execute::execute::request::WorkerSpec;
@@ -94,6 +98,7 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckIndexMap;
 use buck2_hash::BuckIndexSet;
 use buck2_hash::buck_indexmap;
+use buck2_util::strong_hasher::Blake3StrongHasher;
 use buck2_util::thin_box::ThinBoxSlice;
 use derive_more::Display;
 use dupe::Dupe;
@@ -130,6 +135,7 @@ use starlark::values::dict::AllocDict;
 use starlark::values::dict::DictRef;
 use starlark::values::dict::DictType;
 use starlark::values::starlark_value;
+use strong_hash::StrongHash;
 
 use self::dep_files::DepFileBundle;
 use crate::actions::impls::offline;
@@ -200,6 +206,14 @@ impl RunActionKey {
             category: target.category().to_owned(),
             identifier: target.identifier().map(|t| t.to_owned()),
         }
+    }
+
+    fn incremental_state_key(&self) -> String {
+        let mut hasher = Blake3StrongHasher::new();
+        self.owner.strong_hash(&mut hasher);
+        self.category.as_str().strong_hash(&mut hasher);
+        self.identifier.strong_hash(&mut hasher);
+        hex::encode(hasher.finalize().as_bytes())
     }
 }
 
@@ -412,6 +426,7 @@ enum ExecuteResult {
         result: CommandExecutionResult,
         dep_file_bundle: DepFileBundle,
         executor_preference: ExecutorPreference,
+        identical_action_digest: Option<ActionDigest>,
         action_and_blobs: ActionDigestAndBlobs,
         input_files_bytes: u64,
     },
@@ -1065,33 +1080,63 @@ impl RunAction {
         let (prepared_run_action, cmdline_digest_for_dep_files, host_sharing_requirements) =
             self.prepare(&mut run_action_visitor, ctx).await?;
 
+        let req =
+            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
+        let prepared_action = ctx.prepare_action(&req, true)?;
+        let action_cache_digest = prepared_action.digest();
+        let persistent_eligibility = if self
+            .inner
+            .allow_cache_upload
+            .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload)
+            || self.inner.allow_dep_file_cache_upload
+        {
+            PersistentLocalReuseEligibility::Eligible
+        } else {
+            PersistentLocalReuseEligibility::Ineligible
+        };
+        let local_execution_identity = LocalExecutionIdentity {
+            buck_build_id: BuckBuildId(ctx.events().trace_id().to_string()),
+            buck2_daemon_uuid: Buck2DaemonUuid(ctx.events().daemon_id().to_string()),
+        };
+        let local_reuse_keys = req.local_reuse_keys(
+            ctx.digest_config(),
+            ctx.fs(),
+            &local_execution_identity,
+            prepared_action.network_access,
+            persistent_eligibility,
+        )?;
         let dep_file_bundle = make_dep_file_bundle(
             ctx,
             run_action_visitor.dep_files_visitor,
             cmdline_digest_for_dep_files,
-            &prepared_run_action.paths,
-            prepared_run_action.worker.as_ref().map(|w| &w.input_paths),
+            req.paths(),
+            req.worker().as_ref().map(|worker| &worker.input_paths),
+            local_reuse_keys,
         )?;
 
         // First, check in the local dep file cache if an identical action can be found there.
         // Do this before checking the action cache as we can avoid a potentially large download.
         // Once the action cache lookup misses, we will do the full dep file cache look up.
         let (outputs, should_fully_check_dep_file_cache) = dep_file_bundle
-            .check_local_dep_file_cache_for_identical_action(ctx, self.outputs.as_slice())
+            .check_local_dep_file_cache_for_identical_action(
+                ctx,
+                &action_cache_digest,
+                self.outputs.as_slice(),
+            )
             .await?;
         if let Some((outputs, metadata)) = outputs {
             return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
         }
 
-        let req =
-            self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
-
         // Prepare the action, check the action cache, fully check the local dep file cache if needed, then execute the command
-        let prepared_action = ctx.prepare_action(&req, true)?;
         waiting_data.start_waiting_category_now(WaitingCategory::CheckingCaches);
         let manager = ctx.command_execution_manager(waiting_data);
 
-        let action_cache_result = ctx.action_cache(manager, &req, &prepared_action).await;
+        let action_cache_result = if req.outputs_cleanup() {
+            ctx.action_cache(manager, &req, &prepared_action).await
+        } else {
+            ControlFlow::Continue(manager)
+        };
 
         let (req, result) = match action_cache_result {
             ControlFlow::Break(_) => (req, action_cache_result),
@@ -1107,8 +1152,9 @@ impl RunAction {
                     }
                 }
 
-                let supports_remote_dep_files =
-                    self.inner.allow_dep_file_cache_upload && dep_file_bundle.has_dep_files();
+                let supports_remote_dep_files = req.outputs_cleanup()
+                    && self.inner.allow_dep_file_cache_upload
+                    && dep_file_bundle.has_dep_files();
 
                 // Enable remote dep file cache lookup for actions that have remote depfile uploads enabled.
                 if supports_remote_dep_files {
@@ -1185,11 +1231,18 @@ impl RunAction {
                 (execution_result, req, prepared_action.action_and_blobs)
             }
         };
+        let identical_action_digest =
+            if result.was_locally_executed() && action_cache_digest == action_and_blobs.action {
+                Some(action_cache_digest)
+            } else {
+                None
+            };
 
         Ok(ExecuteResult::ExecutedOrReHit {
             result,
             dep_file_bundle,
             executor_preference: req.executor_preference,
+            identical_action_digest,
             action_and_blobs,
             input_files_bytes: req.paths().input_files_bytes(),
         })
@@ -1212,12 +1265,16 @@ impl RunAction {
         };
         let entries = ctx
             .materializer()
-            .get_artifact_entries_for_materialized_paths(output_paths, false)
+            .get_artifact_values_for_materialized_paths(output_paths, false)
             .await?;
         // Only proceed with incremental outputs if every output is present
         Ok(entries
             .into_iter()
-            .map(|entry| entry.map(|(p, e)| CommandExecutionInput::IncrementalRemoteOutput(p, e)))
+            .map(|value| {
+                value.map(|(path, value)| {
+                    CommandExecutionInput::IncrementalRemoteOutput(path, value.entry().dupe())
+                })
+            })
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default())
     }
@@ -1251,18 +1308,15 @@ impl RunAction {
             req = req.with_timeout(timeout);
         }
 
-        if self.inner.no_outputs_cleanup {
-            if self
+        if self.inner.no_outputs_cleanup
+            && self
                 .outputs
                 .iter()
                 .any(|o| o.get_path().is_content_based_path())
-            {
-                req = req.with_run_action_key(Some(
-                    // Using string representation as it is going to be stored in db which requires it to be a string
-                    // doing it early here prevents us from exposing RunActionKey type
-                    RunActionKey::from_action_execution_target(ctx.target()).to_string(),
-                ));
-            }
+        {
+            req = req.with_run_action_key(Some(
+                RunActionKey::from_action_execution_target(ctx.target()).incremental_state_key(),
+            ));
         }
 
         Ok(req)
@@ -1344,10 +1398,10 @@ impl<'v> CommandLineArtifactVisitor<'v> for RunActionVisitor<'v> {
     fn visit_input(&mut self, input: ArtifactGroup, tags: Vec<&ArtifactTag>) {
         // If incremental_metadata_ignore_tags is None, then we're not going to produce
         // incremental metadata at all, so there's nothing to do here.
-        if let Some(ignore_tags) = self.incremental_metadata_ignore_tags {
-            if !tags.iter().any(|t| ignore_tags.contains(*t)) {
-                self.incremental_metadata_inputs.push(input.dupe());
-            }
+        if let Some(ignore_tags) = self.incremental_metadata_ignore_tags
+            && !tags.iter().any(|t| ignore_tags.contains(*t))
+        {
+            self.incremental_metadata_inputs.push(input.dupe());
         }
 
         self.dep_files_visitor.visit_input(input, tags);
@@ -1540,20 +1594,22 @@ impl Action for RunAction {
         ctx: &mut dyn ActionExecutionCtx,
         waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+        let caches_enabled = !self.inner.no_outputs_cleanup;
+
         // Check offline cache first if parameter enabled
-        if self.inner.allow_offline_output_cache
+        if caches_enabled
+            && self.inner.allow_offline_output_cache
             && ctx.run_action_knobs().use_network_action_output_cache
+            && let Some((outputs, metadata)) = self.execute_for_offline(ctx).await?
         {
-            if let Some((outputs, metadata)) = self.execute_for_offline(ctx).await? {
-                return Ok((outputs, metadata));
-            }
-            // Cache miss - fall through to normal execution
+            return Ok((outputs, metadata));
         }
 
         let (
             mut result,
             mut dep_file_bundle,
             executor_preference,
+            identical_action_digest,
             action_and_blobs,
             input_files_bytes,
         ) = match self.execute_inner(ctx, waiting_data).await? {
@@ -1564,23 +1620,27 @@ impl Action for RunAction {
                 result,
                 dep_file_bundle,
                 executor_preference,
+                identical_action_digest,
                 action_and_blobs,
                 input_files_bytes,
             } => (
                 result,
                 dep_file_bundle,
                 executor_preference,
+                identical_action_digest,
                 action_and_blobs,
                 input_files_bytes,
             ),
         };
 
-        let allow_cache_upload = self
-            .inner
-            .allow_cache_upload
-            .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload);
-        let supports_remote_dep_files =
-            self.inner.allow_dep_file_cache_upload && dep_file_bundle.has_dep_files();
+        let allow_cache_upload = caches_enabled
+            && self
+                .inner
+                .allow_cache_upload
+                .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload);
+        let supports_remote_dep_files = caches_enabled
+            && self.inner.allow_dep_file_cache_upload
+            && dep_file_bundle.has_dep_files();
         let incremental_kind = match (
             self.inner.no_outputs_cleanup,
             self.inner.incremental_remote_outputs,
@@ -1592,7 +1652,8 @@ impl Action for RunAction {
         };
 
         // If there is a dep file entry AND if dep file cache upload is enabled, upload it
-        if result.was_success()
+        if caches_enabled
+            && result.was_success()
             && !result.was_served_by_remote_dep_file_cache()
             && (allow_cache_upload || supports_remote_dep_files || force_cache_upload()?)
         {
@@ -1628,13 +1689,13 @@ impl Action for RunAction {
             executor_preference,
             result,
             allow_cache_upload,
-            self.inner.allow_dep_file_cache_upload,
+            supports_remote_dep_files,
             Some(input_files_bytes),
             incremental_kind,
         )?;
 
         // Cache outputs if tracing and parameter enabled
-        if self.inner.allow_offline_output_cache {
+        if caches_enabled && self.inner.allow_offline_output_cache {
             let io_provider = ctx.io_provider();
             if let Some(tracer) = TracingIoProvider::from_io(&*io_provider) {
                 for output in self.outputs.iter() {
@@ -1651,7 +1712,15 @@ impl Action for RunAction {
             }
         }
 
-        populate_dep_files(ctx, dep_file_bundle, &outputs, was_locally_executed).await?;
+        populate_dep_files(
+            ctx,
+            dep_file_bundle,
+            self.outputs.as_slice(),
+            &outputs,
+            was_locally_executed,
+            identical_action_digest.as_ref(),
+        )
+        .await?;
 
         Ok((outputs, metadata))
     }

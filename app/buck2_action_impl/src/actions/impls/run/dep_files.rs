@@ -31,6 +31,7 @@ use buck2_build_signals::env::WaitingData;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::CasDigestData;
 use buck2_common::file_ops::metadata::FileDigest;
+use buck2_common::file_ops::metadata::FileDigestConfig;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::content_hash::ContentBasedPathHash;
@@ -49,6 +50,7 @@ use buck2_error::internal_error;
 use buck2_events::dispatch::span_async_simple;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::artifact_value::ArtifactValueFingerprint;
 use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryBuilder;
@@ -60,13 +62,26 @@ use buck2_execute::directory::INTERNER;
 use buck2_execute::directory::LazyActionDirectoryBuilder;
 use buck2_execute::directory::ReDirectorySerializer;
 use buck2_execute::directory::expand_selector_for_dependencies;
+use buck2_execute::entry::build_entry_from_disk;
+use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobsBuilder;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
 use buck2_execute::execute::request::CommandExecutionPaths;
+use buck2_execute::execute::request::InDaemonLocalReuseKey;
+use buck2_execute::execute::request::LocalReuseKeys;
 use buck2_execute::execute::request::OutputType;
+use buck2_execute::execute::request::PersistentLocalReuseKey;
 use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::materialize::materializer::ActionReuseFilteredInputs;
+use buck2_execute::materialize::materializer::ActionReuseKey;
+use buck2_execute::materialize::materializer::ActionReuseOutput;
+use buck2_execute::materialize::materializer::ActionReuseOutputs;
+use buck2_execute::materialize::materializer::ActionReuseWrite;
+use buck2_execute::materialize::materializer::DepFileActionReuseKey;
+use buck2_execute::materialize::materializer::DepFileActionReuseWrite;
+use buck2_execute::materialize::materializer::IdenticalActionReuseKey;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_file_watcher::dep_files::FLUSH_DEP_FILES;
@@ -80,6 +95,7 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePathNormalizer;
 use buck2_hash::BuckDashMap;
 use buck2_hash::StdBuckHashMap;
 use buck2_hash::StdBuckHashSet;
+use buck2_util::strong_hasher::Blake3StrongHasher;
 use derive_more::Display;
 use dupe::Dupe;
 use futures::StreamExt;
@@ -88,6 +104,7 @@ use parking_lot::MappedMutexGuard;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use starlark_map::ordered_map::OrderedMap;
+use strong_hash::StrongHash;
 use tracing::instrument;
 
 use crate::actions::impls::run::RunActionKey;
@@ -159,14 +176,18 @@ pub(crate) enum StoredFingerprints {
     Dirs(PartitionedInputs<ActionImmutableDirectory>),
 }
 
+impl<'a> From<&'a StoredFingerprints> for Cow<'a, PartitionedInputs<TrackedFileDigest>> {
+    fn from(fingerprints: &'a StoredFingerprints) -> Self {
+        match fingerprints {
+            StoredFingerprints::Digests(fingerprints) => Cow::Borrowed(fingerprints),
+            StoredFingerprints::Dirs(dirs) => Cow::Owned(PartitionedInputs::from(dirs)),
+        }
+    }
+}
+
 impl PartialEq<PartitionedInputs<ActionImmutableDirectory>> for StoredFingerprints {
     fn eq(&self, other: &PartitionedInputs<ActionImmutableDirectory>) -> bool {
-        let fingerprints = match self {
-            Self::Digests(fingerprints) => Cow::Borrowed(fingerprints),
-            Self::Dirs(dirs) => Cow::Owned(dirs.as_fingerprints()),
-        };
-
-        *fingerprints == other.as_fingerprints()
+        *Cow::from(self) == PartitionedInputs::from(other)
     }
 }
 
@@ -191,6 +212,7 @@ pub(crate) struct DepFileState {
 pub(crate) struct CommandDigests {
     pub(crate) cli: ExpandedCommandLineDigest,
     pub(crate) directory: FileDigest,
+    pub(crate) in_daemon_reuse_key: InDaemonLocalReuseKey,
     pub(crate) local_worker_directory: Option<TrackedFileDigest>,
 }
 
@@ -290,10 +312,15 @@ fn get_output_path_digest(
     output_paths: &[(ProjectRelativePathBuf, OutputType)],
 ) -> CasDigestData {
     let mut digester = CasDigestData::digester(digest_config.cas_digest_config());
-    digester.update(&output_paths.len().to_le_bytes());
+    digester.update(&(output_paths.len() as u64).to_le_bytes());
     for (output_path, output_type) in output_paths.iter() {
-        digester.update(output_path.as_str().as_bytes());
-        digester.update(&[*output_type as u8]);
+        digester.update_length_prefixed(output_path.as_str().as_bytes());
+        let output_type = match output_type {
+            OutputType::FileOrDirectory => 0,
+            OutputType::File => 1,
+            OutputType::Directory => 2,
+        };
+        digester.update(&[output_type]);
     }
     digester.finalize()
 }
@@ -340,7 +367,7 @@ impl CommonDigests {
         if let Some(m) = mergebase {
             digester.update(m.as_bytes());
         }
-        let inner_remote_dep_file_key = digester.finalize().to_string();
+        let inner_remote_dep_file_key = hex::encode(digester.finalize().raw_digest().as_bytes());
 
         let mut blobs = ActionDigestAndBlobsBuilder::new(digest_config);
         let command = blobs.add_command(&remote_execution::Command {
@@ -365,17 +392,17 @@ impl CommonDigests {
         declared_dep_files: &DeclaredDepFiles,
         filtered_input_fingerprints: &StoredFingerprints,
     ) -> Vec<DepFileInputs> {
-        let filtered_input_fingerprints = match filtered_input_fingerprints {
-            StoredFingerprints::Digests(digests) => Cow::Borrowed(digests),
-            StoredFingerprints::Dirs(dirs) => Cow::Owned(dirs.as_fingerprints()),
-        };
+        let filtered_input_fingerprints = Cow::from(filtered_input_fingerprints);
         declared_dep_files
             .tagged
             .iter()
             // Both declared inputs and filtered fingerprints are constructed with preserved input ordering
             .zip(filtered_input_fingerprints.tagged.iter())
             .map(|((_, dep_file), (_, filtered_fingerprint))| DepFileInputs {
-                dep_file_path: dep_file.output.get_path().to_string(),
+                dep_file_path: dep_file
+                    .output
+                    .get_path()
+                    .with_short_path(|path| path.as_str().to_owned()),
                 filtered_fingerprint: filtered_fingerprint.raw_digest().as_bytes().to_vec(),
             })
             .collect()
@@ -401,13 +428,142 @@ impl CommonDigests {
     }
 }
 
+struct NonEmptyDeclaredDepFiles(DeclaredDepFiles);
+
+impl NonEmptyDeclaredDepFiles {
+    fn new(declared_dep_files: DeclaredDepFiles) -> Option<Self> {
+        if declared_dep_files.is_empty() {
+            None
+        } else {
+            Some(Self(declared_dep_files))
+        }
+    }
+
+    fn digest(&self, digest_config: DigestConfig) -> CasDigestData {
+        let mut entries = self
+            .0
+            .tagged
+            .values()
+            .map(|dep_file| {
+                (dep_file.label.as_ref().to_owned(), {
+                    let mut state = Blake3StrongHasher::new();
+                    dep_file.output.get_path().strong_hash(&mut state);
+                    *state.finalize().as_bytes()
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        let mut digester = CasDigestData::digester(digest_config.cas_digest_config());
+        digester.update(&(entries.len() as u64).to_le_bytes());
+        for (label, path) in entries {
+            digester.update_length_prefixed(label.as_bytes());
+            digester.update(&path);
+        }
+        digester.finalize()
+    }
+}
+
+impl AsRef<DeclaredDepFiles> for NonEmptyDeclaredDepFiles {
+    fn as_ref(&self) -> &DeclaredDepFiles {
+        &self.0
+    }
+}
+
+fn dep_file_action_reuse_key(
+    digest_config: DigestConfig,
+    common_digests: &CommonDigests,
+    declared_dep_files: &NonEmptyDeclaredDepFiles,
+    re_platform: &remote_execution::Platform,
+    local_reuse_key: &PersistentLocalReuseKey,
+) -> DepFileActionReuseKey {
+    let common_digest = common_digests.fingerprint(digest_config);
+    let declared_dep_files_digest = declared_dep_files.digest(digest_config);
+    let mut properties = re_platform
+        .properties
+        .iter()
+        .map(|property| (property.name.as_str(), property.value.as_str()))
+        .collect::<Vec<_>>();
+    properties.sort();
+    let mut digester = CasDigestData::digester(digest_config.cas_digest_config());
+    digester.update(&(properties.len() as u64).to_le_bytes());
+    for (name, value) in properties {
+        digester.update_length_prefixed(name.as_bytes());
+        digester.update_length_prefixed(value.as_bytes());
+    }
+    let execution_platform_digest = digester.finalize();
+    DepFileActionReuseKey {
+        common_digest,
+        declared_dep_files_digest,
+        execution_platform_digest,
+        local_reuse_key: local_reuse_key.as_ref().dupe(),
+    }
+}
+
+impl From<&StoredFingerprints> for ActionReuseFilteredInputs {
+    fn from(fingerprints: &StoredFingerprints) -> Self {
+        let fingerprints = Cow::from(fingerprints);
+        Self {
+            untagged: fingerprints.untagged.dupe(),
+            tagged: fingerprints
+                .tagged
+                .iter()
+                .map(|(tag, digest)| (tag.as_ref().to_owned(), digest.dupe()))
+                .collect(),
+        }
+    }
+}
+
+impl From<&PartitionedInputs<ActionImmutableDirectory>> for ActionReuseFilteredInputs {
+    fn from(fingerprints: &PartitionedInputs<ActionImmutableDirectory>) -> Self {
+        let fingerprints = PartitionedInputs::from(fingerprints);
+        Self {
+            untagged: fingerprints.untagged,
+            tagged: fingerprints
+                .tagged
+                .into_iter()
+                .map(|(tag, digest)| (tag.as_ref().to_owned(), digest))
+                .collect(),
+        }
+    }
+}
+
+fn action_reuse_outputs(
+    declared_outputs: &[BuildArtifact],
+    outputs: &ActionOutputs,
+) -> buck2_error::Result<ActionReuseOutputs> {
+    let mut reuse_outputs = Vec::with_capacity(declared_outputs.len());
+    for declared_output in declared_outputs {
+        let path = declared_output.get_path();
+        let Some(value) = outputs.get(path) else {
+            return Err(internal_error!(
+                "Action output `{}` was missing from ActionOutputs",
+                path
+            ));
+        };
+        reuse_outputs.push(ActionReuseOutput {
+            output_path: path.path().to_owned(),
+            content_based_path_hash: value.content_based_path_hash(),
+            artifact_value_fingerprint: ArtifactValueFingerprint::from(value),
+        });
+    }
+    ActionReuseOutputs::new(reuse_outputs)
+}
+
 pub(crate) struct DepFileBundle {
     dep_files_key: RunActionKey,
     input_directory_digest: FileDigest,
-    shared_declared_inputs: Option<PartitionedInputs<ActionSharedDirectory>>,
-    declared_dep_files: DeclaredDepFiles,
-    filtered_input_fingerprints: Option<StoredFingerprints>,
+    dep_files: DepFilesState,
     common_digests: CommonDigests,
+    local_reuse_keys: LocalReuseKeys,
+}
+
+enum DepFilesState {
+    NoDepFiles,
+    Declared {
+        declared_dep_files: NonEmptyDeclaredDepFiles,
+        shared_declared_inputs: PartitionedInputs<ActionSharedDirectory>,
+        filtered_input_fingerprints: Option<StoredFingerprints>,
+    },
 }
 
 #[async_trait]
@@ -429,73 +585,215 @@ impl IntoRemoteDepFile for DepFileBundle {
         materializer: &dyn Materializer,
         result: &CommandExecutionResult,
     ) -> buck2_error::Result<Option<RemoteDepFile>> {
-        let shared_declared_inputs = match &self.shared_declared_inputs {
-            Some(shared_declared_inputs) => shared_declared_inputs,
-            None => {
-                return Ok(None);
-            }
+        let DepFilesState::Declared {
+            declared_dep_files,
+            shared_declared_inputs,
+            filtered_input_fingerprints,
+        } = &mut self.dep_files
+        else {
+            return Ok(None);
         };
 
-        // Compute the input fingerprint digest if it hasn't been computed already.
-        if self.filtered_input_fingerprints.is_none() {
-            let action_outputs = ActionOutputs::new(
-                result
-                    .outputs
-                    .iter()
-                    .filter_map(|(o, v)| {
-                        Some((o.as_ref().into_build_artifact()?.0.dupe(), v.dupe()))
-                    })
-                    .collect(),
-            );
-
-            self.filtered_input_fingerprints = Some(
-                eagerly_compute_fingerprints(
+        let filtered_input_fingerprints = match filtered_input_fingerprints {
+            Some(filtered_input_fingerprints) => filtered_input_fingerprints,
+            filtered_input_fingerprints @ None => {
+                let action_outputs = ActionOutputs::new(
+                    result
+                        .outputs
+                        .iter()
+                        .filter_map(|(o, v)| {
+                            Some((o.as_ref().into_build_artifact()?.0.dupe(), v.dupe()))
+                        })
+                        .collect(),
+                );
+                let fingerprints = eagerly_compute_fingerprints(
                     digest_config,
                     fs,
                     materializer,
                     shared_declared_inputs,
-                    &self.declared_dep_files,
+                    declared_dep_files.as_ref(),
                     &action_outputs,
                 )
-                .await?,
-            );
-        }
-
+                .await?;
+                filtered_input_fingerprints.insert(fingerprints)
+            }
+        };
         Ok(Some(self.common_digests.make_dep_file_entry_proto(
-            &self.declared_dep_files,
-            self.filtered_input_fingerprints.as_ref().unwrap(),
+            declared_dep_files.as_ref(),
+            filtered_input_fingerprints,
         )))
     }
 }
 
 impl DepFileBundle {
     pub(crate) fn has_dep_files(&self) -> bool {
-        !self.declared_dep_files.is_empty()
+        match &self.dep_files {
+            DepFilesState::NoDepFiles => false,
+            DepFilesState::Declared { .. } => true,
+        }
+    }
+
+    async fn check_action_reuse(
+        &self,
+        ctx: &mut dyn ActionExecutionCtx,
+        lookup: ActionReuseKey,
+        declared_outputs: &[BuildArtifact],
+    ) -> Option<ActionOutputs> {
+        let materializer = ctx.materializer();
+        let result = async {
+            let (key, outputs, filtered_inputs) = match lookup {
+                ActionReuseKey::IdenticalAction(key) => {
+                    let Some(outputs) = materializer.get_identical_action(key.dupe()).await? else {
+                        return Ok(None);
+                    };
+                    (ActionReuseKey::from(key), outputs, None)
+                }
+                ActionReuseKey::DepFile(key) => {
+                    let Some(data) = materializer.get_dep_file(key.dupe()).await? else {
+                        return Ok(None);
+                    };
+                    (
+                        ActionReuseKey::from(key),
+                        data.outputs,
+                        Some(data.filtered_inputs),
+                    )
+                }
+            };
+            let mut resolved_outputs = Vec::with_capacity(declared_outputs.len());
+            for declared_output in declared_outputs {
+                let Some(output) = outputs.get(declared_output.get_path().path()) else {
+                    return Ok(None);
+                };
+                let path = ctx.fs().buck_out_path_resolver().resolve_gen(
+                    declared_output.get_path(),
+                    Some(&output.content_based_path_hash),
+                )?;
+                resolved_outputs.push((path, output));
+            }
+            let values = materializer
+                .get_artifact_values_for_materialized_paths(
+                    resolved_outputs
+                        .iter()
+                        .map(|(path, _)| (*path).clone())
+                        .collect(),
+                    false,
+                )
+                .await?;
+            let mut action_outputs = Vec::with_capacity(declared_outputs.len());
+            for ((declared_output, value), (materializer_path, output)) in
+                std::iter::zip(std::iter::zip(declared_outputs, values), resolved_outputs)
+            {
+                let Some((_, value)) = value else {
+                    return Ok(None);
+                };
+                let (entry, _) = build_entry_from_disk(
+                    ctx.fs().fs().resolve(&materializer_path),
+                    FileDigestConfig::build(ctx.digest_config().cas_digest_config()),
+                    ctx.blocking_executor(),
+                    ctx.fs().fs().root(),
+                )
+                .await?;
+                let Some(entry) = entry else {
+                    return Ok(None);
+                };
+                let entry = entry.map_dir(|directory| {
+                    directory
+                        .fingerprint(ctx.digest_config().as_directory_serializer())
+                        .shared(&*INTERNER)
+                });
+                if value.entry() != &entry {
+                    return Ok(None);
+                }
+                if ArtifactValueFingerprint::from(&value) != output.artifact_value_fingerprint {
+                    return Ok(None);
+                }
+                action_outputs.push((declared_output.get_path().dupe(), value));
+            }
+            let action_outputs = ActionOutputs::new(action_outputs.into_iter().collect());
+            if let Some(filtered_inputs) = filtered_inputs.as_ref() {
+                let DepFilesState::Declared {
+                    declared_dep_files,
+                    shared_declared_inputs,
+                    ..
+                } = &self.dep_files
+                else {
+                    return Ok(None);
+                };
+                if !filtered_inputs_match(
+                    ctx,
+                    false,
+                    declared_dep_files.as_ref(),
+                    &action_outputs,
+                    shared_declared_inputs,
+                    StoredFilteredInputs::ActionReuse(filtered_inputs),
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some((action_outputs, key)))
+        }
+        .await;
+        let (outputs, key) = match result {
+            Ok(Some(hit)) => hit,
+            Ok(None) => return None,
+            Err(error) => {
+                let _ = soft_error!(
+                    "action_reuse_lookup_error",
+                    error,
+                    quiet: true
+                );
+                return None;
+            }
+        };
+        if let Err(error) = materializer.touch_action_reuse(key).await {
+            let _ = soft_error!(
+                "action_reuse_touch_error",
+                error,
+                quiet: true
+            );
+        }
+        Some(outputs)
     }
 
     pub(crate) async fn check_local_dep_file_cache_for_identical_action(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
+        action_digest: &ActionDigest,
         declared_outputs: &[BuildArtifact],
     ) -> buck2_error::Result<(Option<(ActionOutputs, ActionExecutionMetadata)>, bool)> {
+        let persistent = &self.local_reuse_keys.persistent;
+
         // Get the action outputs (if cache hit) and an indicator on whether a full lookup operation should be performed
         let (outputs, check_filtered_inputs) = span_async_simple(
             buck2_data::MatchDepFilesStart {
                 checking_filtered_inputs: false,
                 remote_cache: false,
             },
-            match_if_identical_action(
-                ctx,
-                &self.dep_files_key,
-                &self.input_directory_digest,
-                &self.common_digests.local_worker_inputs_digest,
-                &self.common_digests.commandline_cli_digest,
-                declared_outputs,
-                &self.declared_dep_files,
-            ),
+            match_if_identical_action(ctx, self, declared_outputs),
             buck2_data::MatchDepFilesEnd {},
         )
         .await?;
+        let outputs = match outputs {
+            Some(outputs) => Some(outputs),
+            None => match persistent {
+                Some(persistent) => {
+                    let key = IdenticalActionReuseKey {
+                        action_digest: action_digest.dupe(),
+                        local_reuse_key: persistent.as_ref().dupe(),
+                    };
+                    self.check_action_reuse(
+                        ctx,
+                        ActionReuseKey::IdenticalAction(key),
+                        declared_outputs,
+                    )
+                    .await
+                }
+                None => None,
+            },
+        };
+        let is_hit = outputs.is_some();
         let outputs = outputs.map(|o| {
             (
                 o,
@@ -507,7 +805,10 @@ impl DepFileBundle {
                 },
             )
         });
-        Ok((outputs, check_filtered_inputs))
+        Ok((
+            outputs,
+            !is_hit && (check_filtered_inputs || self.has_dep_files()),
+        ))
     }
 
     pub(crate) async fn check_local_dep_file_cache(
@@ -515,26 +816,42 @@ impl DepFileBundle {
         ctx: &mut dyn ActionExecutionCtx,
         declared_outputs: &[BuildArtifact],
     ) -> buck2_error::Result<Option<(ActionOutputs, ActionExecutionMetadata)>> {
-        let matching_result = span_async_simple(
+        let persistent = &self.local_reuse_keys.persistent;
+
+        let outputs = span_async_simple(
             buck2_data::MatchDepFilesStart {
                 checking_filtered_inputs: true,
                 remote_cache: false,
             },
-            match_or_clear_dep_file(
-                ctx,
-                &self.dep_files_key,
-                &self.input_directory_digest,
-                &self.common_digests.local_worker_inputs_digest,
-                &self.common_digests.commandline_cli_digest,
-                &self.shared_declared_inputs,
-                declared_outputs,
-                &self.declared_dep_files,
-            ),
+            match_or_clear_dep_file(ctx, self, declared_outputs),
             buck2_data::MatchDepFilesEnd {},
         )
         .await?;
+        let outputs = match outputs {
+            Some(outputs) => Some(outputs),
+            None => {
+                let DepFilesState::Declared {
+                    declared_dep_files, ..
+                } = &self.dep_files
+                else {
+                    return Ok(None);
+                };
+                let Some(persistent) = persistent else {
+                    return Ok(None);
+                };
+                let key = dep_file_action_reuse_key(
+                    ctx.digest_config(),
+                    &self.common_digests,
+                    declared_dep_files,
+                    ctx.re_platform(),
+                    persistent,
+                );
+                self.check_action_reuse(ctx, ActionReuseKey::DepFile(key), declared_outputs)
+                    .await
+            }
+        };
 
-        let matching_result = matching_result.map(|o| {
+        let outputs = outputs.map(|o| {
             (
                 o,
                 ActionExecutionMetadata {
@@ -545,7 +862,7 @@ impl DepFileBundle {
                 },
             )
         });
-        Ok(matching_result)
+        Ok(outputs)
     }
 
     pub(crate) async fn check_remote_dep_file_entry(
@@ -576,17 +893,31 @@ impl DepFileBundle {
             return Ok(false);
         }
 
+        let DepFilesState::Declared {
+            declared_dep_files,
+            shared_declared_inputs,
+            ..
+        } = &self.dep_files
+        else {
+            return Ok(false);
+        };
+        let declared_dep_files = declared_dep_files.as_ref();
+
         // Ensure the declared dep files are the same
-        if self.declared_dep_files.tagged.len() != found.dep_file_inputs.len() {
+        if declared_dep_files.tagged.len() != found.dep_file_inputs.len() {
             tracing::debug!("Remote dep files miss: declared dep file counts are different");
             return Ok(false);
         }
-        let different_dep_files_count = self
-            .declared_dep_files
+        let different_dep_files_count = declared_dep_files
             .tagged
             .iter()
             .zip(found.dep_file_inputs.iter())
-            .filter(|((_, d1), d2)| d1.output.get_path().to_string() != d2.dep_file_path)
+            .filter(|((_, declared), found)| {
+                declared
+                    .output
+                    .get_path()
+                    .with_short_path(|path| path.as_str() != found.dep_file_path)
+            })
             .count();
         if different_dep_files_count != 0 {
             tracing::debug!("Remote dep files miss: declared dep files are different");
@@ -609,7 +940,7 @@ impl DepFileBundle {
         let dep_files = read_dep_files(
             false,
             // The declared dep files of this and the found action are the same
-            &self.declared_dep_files,
+            declared_dep_files,
             &action_outputs,
             fs,
             materializer,
@@ -625,10 +956,8 @@ impl DepFileBundle {
             }
         };
 
-        let computed_filtered_fingerprints = self
-            .shared_declared_inputs
+        let computed_filtered_fingerprints = shared_declared_inputs
             .clone()
-            .ok_or_else(|| buck2_error::internal_error!("Dep files should have been declared"))?
             .unshare()
             .filter(dep_files, fs)?
             .fingerprint(digest_config);
@@ -658,6 +987,7 @@ pub(crate) fn make_dep_file_bundle<'a>(
     expanded_command_line_digest: ExpandedCommandLineDigest,
     execution_paths: &'a CommandExecutionPaths,
     local_worker_execution_paths: Option<&'a CommandExecutionPaths>,
+    local_reuse_keys: LocalReuseKeys,
 ) -> buck2_error::Result<DepFileBundle> {
     let input_directory_digest = execution_paths.input_directory().fingerprint();
     let dep_files_key = RunActionKey::from_action_execution_target(ctx.target());
@@ -681,15 +1011,24 @@ pub(crate) fn make_dep_file_bundle<'a>(
         tagged: tagged_outputs,
     };
 
-    let (shared_declared_inputs, untagged_inputs_digest) = if !declared_dep_files.is_empty() {
-        let shared_declared_inputs = declared_inputs
-            .to_directories(ctx)?
-            .share(ctx.digest_config());
-        let untagged_inputs_digest = shared_declared_inputs.untagged.fingerprint().dupe();
-        (Some(shared_declared_inputs), untagged_inputs_digest)
-    } else {
-        (None, input_directory_digest.dupe())
-    };
+    let (dep_files, untagged_inputs_digest) =
+        match NonEmptyDeclaredDepFiles::new(declared_dep_files) {
+            Some(declared_dep_files) => {
+                let shared_declared_inputs = declared_inputs
+                    .to_directories(ctx)?
+                    .share(ctx.digest_config());
+                let untagged_inputs_digest = shared_declared_inputs.untagged.fingerprint().dupe();
+                (
+                    DepFilesState::Declared {
+                        declared_dep_files,
+                        shared_declared_inputs,
+                        filtered_input_fingerprints: None,
+                    },
+                    untagged_inputs_digest,
+                )
+            }
+            None => (DepFilesState::NoDepFiles, input_directory_digest.dupe()),
+        };
 
     // Construct digests needed to construct a remote dep file key and remote dep file entry (if needed)
     let common_digests = CommonDigests {
@@ -706,43 +1045,29 @@ pub(crate) fn make_dep_file_bundle<'a>(
     Ok(DepFileBundle {
         dep_files_key,
         input_directory_digest: input_directory_digest.data().dupe(),
-        shared_declared_inputs,
-        declared_dep_files,
+        dep_files,
         common_digests,
-        // We will lazily compute this when we need it.
-        filtered_input_fingerprints: None,
+        local_reuse_keys,
     })
 }
 
 /// See if there is an identical action that matches in the cache.
 /// If there is, return the outputs. Otherwise, additionally return a boolean to indicate if the lookup was a miss.
-#[instrument(level = "debug", skip(input_directory_digest,cli_digest,ctx), fields(key = %key))]
-pub(crate) async fn match_if_identical_action(
+#[instrument(level = "debug", skip(bundle, ctx), fields(key = %bundle.dep_files_key))]
+async fn match_if_identical_action(
     ctx: &dyn ActionExecutionCtx,
-    key: &RunActionKey,
-    input_directory_digest: &FileDigest,
-    local_worker_digest: &Option<TrackedFileDigest>,
-    cli_digest: &ExpandedCommandLineDigest,
+    bundle: &DepFileBundle,
     declared_outputs: &[BuildArtifact],
-    declared_dep_files: &DeclaredDepFiles,
 ) -> buck2_error::Result<(Option<ActionOutputs>, bool)> {
-    let previous_state = match get_dep_files(key) {
+    let previous_state = match get_dep_files(&bundle.dep_files_key) {
         Some(d) => d.dupe(),
         None => return Ok((None, false)),
     };
 
-    let actions_match = check_action(
-        key,
-        &previous_state,
-        input_directory_digest,
-        local_worker_digest,
-        cli_digest,
-        declared_outputs,
-        declared_dep_files,
-    );
+    let actions_match = check_action(bundle, &previous_state, declared_outputs);
 
     if actions_match == InitialDepFileLookupResult::Hit
-        && outputs_match(ctx, &previous_state).await?
+        && outputs_match(ctx, previous_state.result()).await?
     {
         tracing::trace!("Dep files are a hit");
         return Ok((Some(previous_state.result.dupe()), false));
@@ -757,41 +1082,25 @@ pub(crate) async fn match_if_identical_action(
 }
 
 /// Match the dep file recorded for key, or clear it from the map (if it exists).
-#[instrument(level = "debug", skip(input_directory_digest,cli_digest,declared_inputs,ctx), fields(key = %key))]
-pub(crate) async fn match_or_clear_dep_file(
+#[instrument(level = "debug", skip(bundle, ctx), fields(key = %bundle.dep_files_key))]
+async fn match_or_clear_dep_file(
     ctx: &dyn ActionExecutionCtx,
-    key: &RunActionKey,
-    input_directory_digest: &FileDigest,
-    local_worker_digest: &Option<TrackedFileDigest>,
-    cli_digest: &ExpandedCommandLineDigest,
-    declared_inputs: &Option<PartitionedInputs<ActionSharedDirectory>>,
+    bundle: &DepFileBundle,
     declared_outputs: &[BuildArtifact],
-    declared_dep_files: &DeclaredDepFiles,
 ) -> buck2_error::Result<Option<ActionOutputs>> {
-    let previous_state = match get_dep_files(key) {
+    let previous_state = match get_dep_files(&bundle.dep_files_key) {
         Some(d) => d.dupe(),
         None => return Ok(None),
     };
 
-    let dep_files_match = dep_files_match(
-        key,
-        &previous_state,
-        input_directory_digest,
-        local_worker_digest,
-        cli_digest,
-        declared_inputs,
-        declared_outputs,
-        declared_dep_files,
-        ctx,
-    )
-    .await?;
-    if dep_files_match && outputs_match(ctx, &previous_state).await? {
+    let dep_files_match = dep_files_match(bundle, &previous_state, declared_outputs, ctx).await?;
+    if dep_files_match && outputs_match(ctx, previous_state.result()).await? {
         tracing::trace!("Dep files are a hit");
         return Ok(Some(previous_state.result.dupe()));
     }
 
     tracing::trace!("Dep files are a miss, removing the key from cache");
-    DEP_FILES.remove(key);
+    DEP_FILES.remove(&bundle.dep_files_key);
 
     Ok(None)
 }
@@ -803,17 +1112,21 @@ enum InitialDepFileLookupResult {
     CheckFilteredInputs,
 }
 
+enum StoredFilteredInputs<'a> {
+    InDaemon(&'a DepFileState),
+    ActionReuse(&'a ActionReuseFilteredInputs),
+}
+
 async fn outputs_match(
     ctx: &dyn ActionExecutionCtx,
-    previous_state: &Arc<DepFileState>,
+    outputs: &ActionOutputs,
 ) -> buck2_error::Result<bool> {
     let fs = ctx.fs();
 
     // Finally, we need to make sure that the artifacts in the materializer actually
     // match. This is necessary in case a different action wrote to those artifacts and
     // didn't use the same cache key.
-    let output_matches = previous_state
-        .result
+    let output_matches = outputs
         .iter()
         .map(|(path, value)| {
             Ok((
@@ -833,41 +1146,53 @@ async fn outputs_match(
 }
 
 fn check_action(
-    key: &RunActionKey,
+    bundle: &DepFileBundle,
     previous_state: &DepFileState,
-    input_directory_digest: &FileDigest,
-    local_worker_digest: &Option<TrackedFileDigest>,
-    cli_digest: &ExpandedCommandLineDigest,
     declared_outputs: &[BuildArtifact],
-    declared_dep_files: &DeclaredDepFiles,
 ) -> InitialDepFileLookupResult {
-    if !declared_dep_files.declares_same_dep_files(previous_state.declared_dep_files()) {
+    let declares_same_dep_files = match &bundle.dep_files {
+        DepFilesState::NoDepFiles => previous_state.declared_dep_files().is_none(),
+        DepFilesState::Declared {
+            declared_dep_files, ..
+        } => declared_dep_files
+            .as_ref()
+            .declares_same_dep_files(previous_state.declared_dep_files()),
+    };
+    if !declares_same_dep_files {
         // We first need to check if the same dep files existed before or not. If not, then we
         // can't assume they'll still be on disk, and we have to bail.
         tracing::trace!("Dep files miss: Dep files declaration has changed");
-        DEP_FILES.remove(key);
+        DEP_FILES.remove(&bundle.dep_files_key);
         return InitialDepFileLookupResult::Miss;
     }
 
     if !outputs_are_reusable(declared_outputs, &previous_state.result) {
         tracing::trace!("Dep files miss: Output declaration has changed");
-        DEP_FILES.remove(key);
+        DEP_FILES.remove(&bundle.dep_files_key);
         return InitialDepFileLookupResult::Miss;
     }
 
-    if *cli_digest != previous_state.digests.cli {
+    if bundle.common_digests.commandline_cli_digest != previous_state.digests.cli {
         tracing::trace!("Dep files miss: Command line has changed");
-        DEP_FILES.remove(key);
+        DEP_FILES.remove(&bundle.dep_files_key);
         return InitialDepFileLookupResult::Miss;
     }
 
-    if *local_worker_digest != previous_state.digests.local_worker_directory {
-        tracing::trace!("Dep files miss: Local worker directory has changed");
-        DEP_FILES.remove(key);
+    if bundle.local_reuse_keys.in_daemon != previous_state.digests.in_daemon_reuse_key {
+        tracing::trace!("Dep files miss: In-daemon reuse key has changed");
+        DEP_FILES.remove(&bundle.dep_files_key);
         return InitialDepFileLookupResult::Miss;
     }
 
-    if *input_directory_digest == previous_state.digests.directory {
+    if bundle.common_digests.local_worker_inputs_digest
+        != previous_state.digests.local_worker_directory
+    {
+        tracing::trace!("Dep files miss: Local worker inputs have changed");
+        DEP_FILES.remove(&bundle.dep_files_key);
+        return InitialDepFileLookupResult::Miss;
+    }
+
+    if bundle.input_directory_digest == previous_state.digests.directory {
         // The actions are identical
         tracing::trace!("Dep files hit: Command line and directory have not changed");
         return InitialDepFileLookupResult::Hit;
@@ -876,33 +1201,23 @@ fn check_action(
 }
 
 async fn dep_files_match(
-    key: &RunActionKey,
+    bundle: &DepFileBundle,
     previous_state: &DepFileState,
-    input_directory_digest: &FileDigest,
-    local_worker_digest: &Option<TrackedFileDigest>,
-    cli_digest: &ExpandedCommandLineDigest,
-    declared_inputs: &Option<PartitionedInputs<ActionSharedDirectory>>,
     declared_outputs: &[BuildArtifact],
-    declared_dep_files: &DeclaredDepFiles,
     ctx: &dyn ActionExecutionCtx,
 ) -> buck2_error::Result<bool> {
-    let initial_check = check_action(
-        key,
-        previous_state,
-        input_directory_digest,
-        local_worker_digest,
-        cli_digest,
-        declared_outputs,
-        declared_dep_files,
-    );
+    let initial_check = check_action(bundle, previous_state, declared_outputs);
     if initial_check == InitialDepFileLookupResult::Hit {
         return Ok(true);
     }
 
-    // We didn't get an exact match, and we don't have any dep files, so we're done.
-    if declared_dep_files.is_empty() {
+    let DepFilesState::Declared {
+        shared_declared_inputs,
+        ..
+    } = &bundle.dep_files
+    else {
         return Ok(false);
-    }
+    };
 
     let previous_declared_dep_files = match previous_state.has_declared_dep_files {
         Some(ref has_declared_dep_files) => &has_declared_dep_files.declared_dep_files,
@@ -911,62 +1226,71 @@ async fn dep_files_match(
         }
     };
 
-    let dep_files = read_dep_files(
+    filtered_inputs_match(
+        ctx,
         previous_state.has_signatures(),
         previous_declared_dep_files,
         previous_state.result(),
-        ctx.fs(),
-        ctx.materializer(),
+        shared_declared_inputs,
+        StoredFilteredInputs::InDaemon(previous_state),
     )
     .await
     .buck_error_context(
         "Error reading persisted dep files. \
             Fix the command that produced an invalid dep file. \
             You may also use `buck2 debug flush-dep-files` to drop all dep file state.",
-    )?;
-
-    let dep_files = match dep_files {
-        Some(dep_files) => dep_files,
-        None => {
-            tracing::trace!("Dep files miss: Dep files cannot be materialized");
-            return Ok(false);
-        }
-    };
-
-    // Now we need to know the fingerprints on the original action. Produce them if they're
-    // missing. We're either storing input directories or outputs here.
-
-    let digest_config = ctx.digest_config();
-
-    let fingerprints_match = {
-        // NOTE: We don't bother releasing the guard here (we'd have to clone the fingerprints to do
-        // so), because this Mutex won't be contended: only one action will look at its value.
-        let previous_fingerprints = previous_state.locked_compute_fingerprints(
-            Cow::Borrowed(&dep_files),
-            keep_directories()?,
-            digest_config,
-            ctx.fs(),
-        )?;
-
-        // NOTE: We use the new directory to e.g. resolve symlinks referenced in the dep file. This
-        // makes sense: if a path in the depfile is still a symlink, then we'll compare the new
-        // destination and the old. If it's not, then we can assume that the tool wouldn't traverse
-        // the symlink anymore.
-        let new_fingerprints = declared_inputs
-            .clone()
-            .expect("Must have declared inputs when we have dep-files!")
-            .unshare()
-            .filter(dep_files, ctx.fs())?
-            .fingerprint(digest_config);
-        *previous_fingerprints == new_fingerprints
-    };
-
-    Ok(fingerprints_match)
+    )
 }
 
-/// If an action is unchanged but now requires a different set of outputs, that's not a cache hit
-/// because we need to rehash the outputs. Having to re-run the action isn't the best, but it's
-/// probably infrequent enough that we seem unlikely to care.
+async fn filtered_inputs_match(
+    ctx: &dyn ActionExecutionCtx,
+    has_signatures: bool,
+    declared_dep_files: &DeclaredDepFiles,
+    outputs: &ActionOutputs,
+    declared_inputs: &PartitionedInputs<ActionSharedDirectory>,
+    stored: StoredFilteredInputs<'_>,
+) -> buck2_error::Result<bool> {
+    let Some(dep_files) = read_dep_files(
+        has_signatures,
+        declared_dep_files,
+        outputs,
+        ctx.fs(),
+        ctx.materializer(),
+    )
+    .await?
+    else {
+        tracing::trace!("Dep files miss: Dep files cannot be materialized");
+        return Ok(false);
+    };
+    let digest_config = ctx.digest_config();
+    match stored {
+        StoredFilteredInputs::InDaemon(previous_state) => {
+            let previous_fingerprints = previous_state.locked_compute_fingerprints(
+                Cow::Borrowed(&dep_files),
+                keep_directories()?,
+                digest_config,
+                ctx.fs(),
+            )?;
+            let current = declared_inputs
+                .clone()
+                .unshare()
+                .filter(dep_files, ctx.fs())?
+                .fingerprint(digest_config);
+            Ok(*previous_fingerprints == current)
+        }
+        StoredFilteredInputs::ActionReuse(previous_fingerprints) => {
+            let current = declared_inputs
+                .clone()
+                .unshare()
+                .filter(dep_files, ctx.fs())?
+                .fingerprint(digest_config);
+            Ok(previous_fingerprints == &ActionReuseFilteredInputs::from(&current))
+        }
+    }
+}
+
+/// A stored superset remains reusable, but every output currently declared by the action must be
+/// present because newly required outputs cannot be reconstructed from the older result.
 fn outputs_are_reusable(declared_outputs: &[BuildArtifact], outputs: &ActionOutputs) -> bool {
     for out in declared_outputs {
         if outputs.get(out.get_path()).is_none() {
@@ -1020,9 +1344,9 @@ fn compute_fingerprints(
     if keep_directories {
         Ok(StoredFingerprints::Dirs(filtered_directories))
     } else {
-        Ok(StoredFingerprints::Digests(
-            filtered_directories.as_fingerprints(),
-        ))
+        Ok(StoredFingerprints::Digests(PartitionedInputs::from(
+            &filtered_directories,
+        )))
     }
 }
 
@@ -1052,72 +1376,141 @@ async fn eagerly_compute_fingerprints(
 pub(crate) async fn populate_dep_files(
     ctx: &dyn ActionExecutionCtx,
     dep_file_bundle: DepFileBundle,
+    declared_outputs: &[BuildArtifact],
     result: &ActionOutputs,
     was_produced_locally: bool,
+    identical_action_digest: Option<&ActionDigest>,
 ) -> buck2_error::Result<()> {
     let DepFileBundle {
-        declared_dep_files,
         dep_files_key,
         input_directory_digest,
+        mut dep_files,
+        common_digests,
+        local_reuse_keys,
+    } = dep_file_bundle;
+    let LocalReuseKeys {
+        in_daemon,
+        persistent,
+    } = local_reuse_keys;
+    let materializer = ctx.materializer();
+    let eager_dep_files = ctx.run_action_knobs().eager_dep_files;
+    let should_write_action_reuse =
+        was_produced_locally && !declared_outputs.is_empty() && persistent.is_some();
+    if let DepFilesState::Declared {
+        declared_dep_files,
         shared_declared_inputs,
         filtered_input_fingerprints,
-        common_digests,
-    } = dep_file_bundle;
-    let should_compute_fingerprints = ctx.run_action_knobs().eager_dep_files;
+    } = &mut dep_files
+        && filtered_input_fingerprints.is_none()
+        && (eager_dep_files || should_write_action_reuse)
+    {
+        match eagerly_compute_fingerprints(
+            ctx.digest_config(),
+            ctx.fs(),
+            materializer,
+            shared_declared_inputs,
+            declared_dep_files.as_ref(),
+            result,
+        )
+        .await
+        {
+            Ok(fingerprints) => *filtered_input_fingerprints = Some(fingerprints),
+            Err(error) if eager_dep_files => return Err(error),
+            Err(error) => {
+                let _ = soft_error!(
+                    "action_reuse_dep_file_fingerprint_error",
+                    error,
+                    quiet: true
+                );
+            }
+        }
+    }
+    if was_produced_locally
+        && !declared_outputs.is_empty()
+        && let Some(persistent) = persistent.as_ref()
+    {
+        let identical_action =
+            identical_action_digest.map(|action_digest| IdenticalActionReuseKey {
+                action_digest: action_digest.dupe(),
+                local_reuse_key: persistent.as_ref().dupe(),
+            });
+        let mut dep_file = None;
+
+        if let DepFilesState::Declared {
+            declared_dep_files,
+            filtered_input_fingerprints: Some(fingerprints),
+            ..
+        } = &dep_files
+        {
+            let key = dep_file_action_reuse_key(
+                ctx.digest_config(),
+                &common_digests,
+                declared_dep_files,
+                ctx.re_platform(),
+                persistent,
+            );
+            dep_file = Some(DepFileActionReuseWrite {
+                key,
+                filtered_inputs: fingerprints.into(),
+            });
+        }
+        match action_reuse_outputs(declared_outputs, result) {
+            Ok(outputs) => {
+                let write = match (identical_action, dep_file) {
+                    (Some(key), None) => Some(ActionReuseWrite::IdenticalAction { key, outputs }),
+                    (None, Some(dep_file)) => Some(ActionReuseWrite::DepFile { dep_file, outputs }),
+                    (Some(identical_action), Some(dep_file)) => {
+                        Some(ActionReuseWrite::IdenticalActionAndDepFile {
+                            identical_action,
+                            dep_file,
+                            outputs,
+                        })
+                    }
+                    (None, None) => None,
+                };
+                if let Some(write) = write
+                    && let Err(e) = materializer.put_action_reuse(write).await
+                {
+                    let _ = soft_error!("action_reuse_put_error", e, quiet: true);
+                }
+            }
+            Err(e) => {
+                let _ = soft_error!("action_reuse_outputs_error", e, quiet: true);
+            }
+        }
+    }
+
     let digests = CommandDigests {
         cli: common_digests.commandline_cli_digest,
         directory: input_directory_digest,
+        in_daemon_reuse_key: in_daemon,
         local_worker_directory: common_digests.local_worker_inputs_digest,
     };
 
-    let state = if declared_dep_files.is_empty() {
-        DepFileState {
+    let state = match dep_files {
+        DepFilesState::NoDepFiles => DepFileState {
             digests,
             has_declared_dep_files: None,
             result: result.dupe(),
             was_produced_locally,
-        }
-    } else {
-        match filtered_input_fingerprints {
-            Some(fingerprints) => DepFileState {
+        },
+        DepFilesState::Declared {
+            declared_dep_files,
+            shared_declared_inputs,
+            filtered_input_fingerprints,
+        } => {
+            let input_signatures = match filtered_input_fingerprints {
+                Some(fingerprints) => DepFileStateInputSignatures::Computed(fingerprints),
+                None => DepFileStateInputSignatures::Deferred(Some(shared_declared_inputs)),
+            };
+            DepFileState {
                 digests,
                 result: result.dupe(),
                 was_produced_locally,
                 has_declared_dep_files: Some(HasDeclaredDepFiles {
-                    declared_dep_files,
-                    input_signatures: Mutex::new(DepFileStateInputSignatures::Computed(
-                        fingerprints,
-                    )),
+                    declared_dep_files: declared_dep_files.0,
+                    input_signatures: Mutex::new(input_signatures),
                 }),
-            },
-            None => {
-                let shared_declared_inputs = shared_declared_inputs.ok_or_else(|| {
-                    internal_error!("Must have inputs when dep-files are present!")
-                })?;
-                let input_signatures = if should_compute_fingerprints {
-                    let fingerprints = eagerly_compute_fingerprints(
-                        ctx.digest_config(),
-                        ctx.fs(),
-                        ctx.materializer(),
-                        &shared_declared_inputs,
-                        &declared_dep_files,
-                        result,
-                    )
-                    .await?;
-                    DepFileStateInputSignatures::Computed(fingerprints)
-                } else {
-                    DepFileStateInputSignatures::Deferred(Some(shared_declared_inputs))
-                };
-
-                DepFileState {
-                    digests,
-                    result: result.dupe(),
-                    was_produced_locally,
-                    has_declared_dep_files: Some(HasDeclaredDepFiles {
-                        declared_dep_files,
-                        input_signatures: Mutex::new(input_signatures),
-                    }),
-                }
             }
         }
     };
@@ -1263,7 +1656,7 @@ impl PartitionedInputs<ActionDirectoryBuilder> {
             // - We hit an external symlink, and we can't traverse through those.
             // - The directory structure changed and was a dir is now a leaf, in which case we'll
             // select the leaf but when comparing this to the dir it'll conflict.
-            let _ignored = matching_selector.filter(builder);
+            let _ = matching_selector.filter(builder);
 
             Ok(())
         }
@@ -1300,11 +1693,11 @@ impl PartitionedInputs<ActionDirectoryBuilder> {
     }
 }
 
-impl PartitionedInputs<ActionImmutableDirectory> {
-    fn as_fingerprints(&self) -> PartitionedInputs<TrackedFileDigest> {
+impl From<&PartitionedInputs<ActionImmutableDirectory>> for PartitionedInputs<TrackedFileDigest> {
+    fn from(inputs: &PartitionedInputs<ActionImmutableDirectory>) -> Self {
         PartitionedInputs {
-            untagged: self.untagged.fingerprint().dupe(),
-            tagged: self
+            untagged: inputs.untagged.fingerprint().dupe(),
+            tagged: inputs
                 .tagged
                 .iter()
                 .map(|(k, v)| (k.dupe(), v.fingerprint().dupe()))
@@ -1854,5 +2247,147 @@ mod tests {
         assert!(decl1.declares_same_dep_files(Some(&decl2)));
         assert!(!decl2.declares_same_dep_files(Some(&decl3)));
         assert!(!decl3.declares_same_dep_files(Some(&decl4)));
+    }
+
+    #[test]
+    fn output_path_digest_frames_paths() {
+        let digest_config = DigestConfig::testing_default();
+        let output_path = ProjectRelativePathBuf::unchecked_new("foo/bar".to_owned());
+        let actual = get_output_path_digest(digest_config, &[(output_path, OutputType::File)]);
+
+        let mut expected = CasDigestData::digester(digest_config.cas_digest_config());
+        expected.update(&1u64.to_le_bytes());
+        expected.update_length_prefixed(b"foo/bar");
+        expected.update(&[1]);
+        let expected = expected.finalize();
+
+        assert!(actual == expected);
+    }
+
+    #[test]
+    fn action_reuse_dep_file_digest_includes_artifact_owner() {
+        let digest_config = DigestConfig::testing_default();
+        let first_target = ConfiguredTargetLabel::testing_parse(
+            "cell//pkg:first",
+            ConfigurationData::testing_new(),
+        );
+        let second_target = ConfiguredTargetLabel::testing_parse(
+            "cell//pkg:second",
+            ConfigurationData::testing_new(),
+        );
+        let first = Artifact::from(BuildArtifact::testing_new(
+            first_target,
+            "same/path.d",
+            ActionIndex::new(0),
+        ));
+        let second = Artifact::from(BuildArtifact::testing_new(
+            second_target,
+            "same/path.d",
+            ActionIndex::new(0),
+        ));
+        let tag = ArtifactTag::testing_new();
+        let first = DeclaredDepFiles {
+            tagged: OrderedMap::from_iter([(
+                tag.dupe(),
+                DeclaredDepFile {
+                    label: Arc::from("dep-file"),
+                    output: first,
+                },
+            )]),
+        };
+        let second = DeclaredDepFiles {
+            tagged: OrderedMap::from_iter([(
+                tag,
+                DeclaredDepFile {
+                    label: Arc::from("dep-file"),
+                    output: second,
+                },
+            )]),
+        };
+
+        let first = NonEmptyDeclaredDepFiles::new(first)
+            .unwrap()
+            .digest(digest_config);
+        let second = NonEmptyDeclaredDepFiles::new(second)
+            .unwrap()
+            .digest(digest_config);
+
+        assert!(first != second);
+    }
+
+    #[test]
+    fn action_reuse_outputs_are_matched_by_logical_path() {
+        let target = ConfiguredTargetLabel::testing_parse(
+            "cell//pkg:action",
+            ConfigurationData::testing_new(),
+        );
+        let first = BuildArtifact::testing_new(target.dupe(), "first", ActionIndex::new(0));
+        let second = BuildArtifact::testing_new(target, "second", ActionIndex::new(0));
+        let outputs = ActionReuseOutputs::new(vec![
+            ActionReuseOutput {
+                output_path: second.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::Scratch,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[2; 32][..])
+                    .unwrap(),
+            },
+            ActionReuseOutput {
+                output_path: first.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[1; 32][..])
+                    .unwrap(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            outputs.get(first.get_path().path()),
+            Some(&ActionReuseOutput {
+                output_path: first.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[1; 32][..])
+                    .unwrap(),
+            })
+        );
+        assert_eq!(
+            outputs.get(second.get_path().path()),
+            Some(&ActionReuseOutput {
+                output_path: second.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::Scratch,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[2; 32][..])
+                    .unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn action_reuse_outputs_accept_a_stored_superset() {
+        let target = ConfiguredTargetLabel::testing_parse(
+            "cell//pkg:action",
+            ConfigurationData::testing_new(),
+        );
+        let declared = BuildArtifact::testing_new(target.dupe(), "declared", ActionIndex::new(0));
+        let removed = BuildArtifact::testing_new(target, "removed", ActionIndex::new(0));
+        let outputs = ActionReuseOutputs::new(vec![
+            ActionReuseOutput {
+                output_path: declared.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::OutputArtifact,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[1; 32][..])
+                    .unwrap(),
+            },
+            ActionReuseOutput {
+                output_path: removed.get_path().path().to_owned(),
+                content_based_path_hash: ContentBasedPathHash::Scratch,
+                artifact_value_fingerprint: ArtifactValueFingerprint::try_from(&[2; 32][..])
+                    .unwrap(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            outputs
+                .get(declared.get_path().path())
+                .map(|output| &output.content_based_path_hash),
+            Some(&ContentBasedPathHash::OutputArtifact)
+        );
     }
 }

@@ -28,6 +28,7 @@ buck2_hash.workspace = true
 buck2_http.workspace = true
 buck2_interpreter.workspace = true
 buck2_util.workspace = true
+strong_hash.workspace = true
 chrono.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
