@@ -15,9 +15,8 @@ RustSourcesTSet = transitive_set(
     },
 )
 
-# Sources of all transitive Rust dependencies. This is required for compilation in order to
-# guarantee consistent crate hashes between local and remote actions.
-# See https://github.com/rust-lang/rust/issues/153898
+# Sources of all transitive Rust dependencies. Source-oriented tools such as
+# rustdoc need these; RDR rustc actions consume dependency metadata instead.
 RustSources = provider(
     fields = {
         "tset": RustSourcesTSet,

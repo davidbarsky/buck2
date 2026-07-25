@@ -36,6 +36,7 @@ RustcLinkOutput = record(
 
 RustcOutput = record(
     output = Artifact,
+    spans = Artifact | None,
     singleton_tset = TransitiveDeps,
     compile_output = RustcCompileOutput,
     # As expected, only available when the combination of params actually

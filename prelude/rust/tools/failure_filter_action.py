@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+from pathlib import Path
 from typing import Any, IO, NamedTuple, Optional
 
 
@@ -67,6 +68,7 @@ def main() -> int:
     if args.required_file:
         for short, inp, out in args.required_file:
             if short in build_status["files"]:
+                Path(out).parent.mkdir(parents=True, exist_ok=True)
                 try:
                     # Try a hard link to avoid unnecessary copies
                     os.link(inp, out)

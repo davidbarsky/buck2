@@ -32,13 +32,13 @@
 #         --out-dir path/to/out \
 #         --artifacts path/to/artifacts.json
 #
-# The input file artifacts.json is an array of pairs.
-# The first element is the rlib paths, the second element is an optional path to a file containing
-# the build-time crate name for the corresponding rlib.
+# The input file artifacts.json is an array of triples. Each triple contains the
+# compiler artifact, its `.spans` file when it contains RDR metadata, and an
+# optional path to a file containing the build-time crate name.
 #
 #     [
-#         [ "../../libprovisional.rlib", "path/to/cratename" ],
-#         [ "../../libfoo.rlib", null ],
+#         [ "../../libprovisional.rlib", "../../libprovisional.spans", "path/to/cratename" ],
+#         [ "../../libfoo.rlib", null, null ],
 #         ...
 #     ]
 #
@@ -106,7 +106,7 @@ def main():
     # Add as many -Ldependency dirs as we need to avoid name conflicts
     deps_dirs = [{}]
 
-    for artifact, crate_name in json.load(args.artifacts):
+    for artifact, spans, crate_name in json.load(args.artifacts):
         is_dynamic = crate_name is not None
         if is_dynamic:
             crate_name = Path(crate_name).read_text().strip()
@@ -119,9 +119,14 @@ def main():
         else:
             filename = os.path.basename(artifact)
 
-        if filename in deps_dirs[-1]:
+        spans_filename = Path(filename).with_suffix(".spans").name if spans else None
+        if filename in deps_dirs[-1] or (
+            spans_filename and spans_filename in deps_dirs[-1]
+        ):
             deps_dirs.append({})
         deps_dirs[-1][filename] = artifact
+        if spans_filename:
+            deps_dirs[-1][spans_filename] = spans
 
     flags = ""
 

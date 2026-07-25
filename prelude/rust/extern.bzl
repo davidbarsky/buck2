@@ -20,7 +20,7 @@ load(
 #
 #     --extern=$(cat path/to/REALNAME)=path/to/libPROVISIONAL.rlib
 #
-def extern_arg(flags: list[str], crate: CrateName, lib: Artifact) -> cmd_args:
+def extern_arg(flags: list[str], crate: CrateName, lib: cmd_args) -> cmd_args:
     if flags == []:
         flags = ""
     else:

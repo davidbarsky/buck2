@@ -19,12 +19,15 @@ def at_argfile(
     args,
     # pass to `ctx.actions.write`
     allow_args: bool = False,
+    # Whether consuming the args file also consumes every artifact it names.
+    # Disable this when the caller carries those artifacts with dependency tags.
+    with_inputs: bool = True,
     has_content_based_path: bool = False,
 ) -> cmd_args:
     if allow_args:
-        args_file, _ = actions.write(name, args, allow_args = True, with_inputs = True, has_content_based_path = has_content_based_path)
+        args_file, _ = actions.write(name, args, allow_args = True, with_inputs = with_inputs, has_content_based_path = has_content_based_path)
     else:
-        args_file = actions.write(name, args, with_inputs = True, has_content_based_path = has_content_based_path)
+        args_file = actions.write(name, args, with_inputs = with_inputs, has_content_based_path = has_content_based_path)
     return cmd_args(args_file, format = "@{}", hidden = args)
 
 # Write arguments to a file, and return the file path as `cmd_args`

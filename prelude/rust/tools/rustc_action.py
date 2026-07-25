@@ -387,6 +387,10 @@ async def main() -> int:  # noqa: C901
             )
         )
 
+    for arg in rustc_args:
+        if arg.startswith("--out-dir="):
+            Path(arg.partition("=")[2]).mkdir(parents=True, exist_ok=True)
+
     with tempfile.NamedTemporaryFile(
         mode="wb",
         prefix="rustc-args-",
@@ -460,6 +464,7 @@ async def main() -> int:  # noqa: C901
             for _short, path in required_output:
                 path = Path(path)
                 if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     path.touch()
             res = 0
 

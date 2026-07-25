@@ -23,11 +23,14 @@ def rewrite_dep_file(src_path, dst_path):
     with open(src_path) as f:
         body = f.read()
 
-    parts = body.split(": ", 1)
-    body = parts[1] if len(parts) == 2 else ""
-
     # Escaped newlines are not meaningful so remove them.
     body = body.replace("\\\n", "")
+
+    # Compilers may emit additional rules for other outputs or missing inputs.
+    # The first rule already contains the complete dependency set.
+    first_rule = body.splitlines()[0] if body else ""
+    parts = first_rule.split(": ", 1)
+    body = parts[1] if len(parts) == 2 else ""
 
     # Now, recover targets. They are space separated, but we need to ignore
     # spaces that are escaped.

@@ -70,6 +70,7 @@ def _make_rustc_shim(ctx: AnalysisContext, cwd: Artifact) -> cmd_args:
         )
         deps = gather_explicit_sysroot_deps(dep_ctx)
         deps = resolve_rust_deps_inner(ctx, deps)
+        rdr_metadata_tag = ctx.actions.artifact_tag()
         dep_args, dep_argsfiles, _ = dependency_args(
             ctx = ctx,
             internal_tools_info = ctx.attrs._rust_internal_tools_toolchain[RustInternalToolsInfo],
@@ -80,6 +81,7 @@ def _make_rustc_shim(ctx: AnalysisContext, cwd: Artifact) -> cmd_args:
             dep_link_strategy = DEFAULT_STATIC_LINK_STRATEGY,
             dep_metadata_kind = MetadataKind("full"),
             is_rustdoc_test = False,
+            rdr_metadata_tag = rdr_metadata_tag,
             cwd = cwd,
         )
 

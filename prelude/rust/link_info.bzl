@@ -127,6 +127,14 @@ RustProcMacroMarker = provider(
     }
 )
 
+# For formats containing RDR metadata, `artifact` and `spans` are the two
+# co-owned files of that metadata artifact. `spans` is absent only for compiler
+# outputs outside the two-file RDR format, including proc macros.
+RustArtifactFiles = record(
+    artifact = field(Artifact),
+    spans = field(Artifact | None),
+)
+
 # Artifact produced by a Rust compiler invocation.
 #
 # The artifact is assigned a provisional filepath at analysis time. However, the
@@ -136,18 +144,18 @@ RustProcMacroMarker = provider(
 # it to create a symlink to make the Rust artifact appear with the required name
 # to later rustc executions.
 RustArtifact = record(
-    artifact = field(Artifact),
+    files = field(RustArtifactFiles),
     crate = field(CrateName),
 )
 
-def _project_artifacts(dep: RustArtifact) -> (Artifact, Artifact | None):
-    return (dep.artifact, dep.crate.dynamic)
+def _project_artifacts(dep: RustArtifact) -> (Artifact, Artifact | None, Artifact | None):
+    return (dep.files.artifact, dep.files.spans, dep.crate.dynamic)
 
 def _project_as_dynamic_name_args(dep: RustArtifact) -> Artifact | cmd_args:
     return dep.crate.dynamic or cmd_args()
 
-def _project_artifacts_args(dep: RustArtifact) -> Artifact:
-    return dep.artifact
+def _project_artifacts_args(dep: RustArtifact) -> cmd_args:
+    return cmd_args(dep.files.artifact, dep.files.spans or [])
 
 # Set of RustArtifact.
 TransitiveDeps = transitive_set(
@@ -162,8 +170,8 @@ TransitiveDeps = transitive_set(
 
 # Information which is keyed on link_style
 RustLinkStrategyInfo = record(
-    # Path to the rlib, rmeta, dylib, etc.
-    outputs = field(dict[MetadataKind, Artifact]),
+    # The complete artifact, including both files when it contains RDR metadata.
+    outputs = field(dict[MetadataKind, RustArtifactFiles]),
     # Same as `outputs`, but wrapped in a 1-element transitive set.
     singleton_tset = field(dict[MetadataKind, TransitiveDeps]),
     # Transitive dependencies which are relevant to the consumer. For crate types which do not
@@ -320,8 +328,6 @@ def _do_resolve_deps(
 def gather_explicit_sysroot_deps(dep_ctx: DepCollectionContext) -> list[RustOrNativeDependency]:
     explicit_sysroot_deps = dep_ctx.explicit_sysroot_deps
     if not explicit_sysroot_deps:
-        if dep_ctx.advanced_unstable_linking:
-            fail("Explicit sysroot deps are required when advanced_unstable_linking is on")
         return []
 
     out = []

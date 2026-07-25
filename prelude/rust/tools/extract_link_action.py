@@ -30,6 +30,7 @@ def eprint(*args: Any, **kwargs: Any) -> None:
 class Args(NamedTuple):
     out_argsfile: IO[str]
     out_artifacts: Path
+    sysroot: Path | None
     linker: list[str]
 
 
@@ -46,6 +47,10 @@ def arg_parse() -> Args:
         required=True,
     )
     parser.add_argument(
+        "--sysroot",
+        type=Path,
+    )
+    parser.add_argument(
         "linker",
         nargs=argparse.REMAINDER,
         type=str,
@@ -55,8 +60,13 @@ def arg_parse() -> Args:
     return Args(**vars(parser.parse_args()))
 
 
-def process_link_args(args: list[str], out_artifacts: Path) -> list[str]:
+def process_link_args(
+    args: list[str],
+    out_artifacts: Path,
+    sysroot: Path | None,
+) -> list[str]:
     new_args = []
+    sysroot = sysroot.resolve() if sysroot else None
 
     i = 0
     size = len(args)
@@ -102,10 +112,22 @@ def process_link_args(args: list[str], out_artifacts: Path) -> list[str]:
             i += 1
             continue
 
+        elif arg.endswith(".rlib") and sysroot is not None:
+            rlib = Path(arg).resolve()
+            try:
+                rlib.relative_to(sysroot)
+            except ValueError:
+                i += 1
+                continue
+            new_path = shutil.copy(rlib, out_artifacts)
+            new_args.append(new_path)
+            i += 1
+            continue
+
         # We don't need either of these, and omitting them from the deferred link args will save
         # us from having to pass them to the deferred link action.
-        # The .rlib files here are hollow rlibs, providing only metadata for each dependency. These
-        # files have no impact on the link step; they're only needed by rustc.
+        # The relative .rlib files here are hollow rlibs, providing only metadata for each
+        # dependency. These files have no impact on the link step; they're only needed by rustc.
         # The .rmeta file contains the metadata section for this crate being linked. Again, since
         # rmeta is not used at all for linking, we can omit the section entirely from our link step.
         elif arg.endswith(".rlib") or arg.endswith(".rmeta"):
@@ -140,7 +162,11 @@ def main() -> int:
 
     os.mkdir(args.out_artifacts)
 
-    filtered_args = process_link_args(args.linker[1:], out_artifacts=args.out_artifacts)
+    filtered_args = process_link_args(
+        args.linker[1:],
+        out_artifacts=args.out_artifacts,
+        sysroot=args.sysroot,
+    )
     args.out_argsfile.write("\n".join(filtered_args))
     args.out_argsfile.close()
 

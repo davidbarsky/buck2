@@ -100,6 +100,7 @@ load(
     ":link_info.bzl",
     "DEFAULT_STATIC_LIB_OUTPUT_STYLE",
     "DEFAULT_STATIC_LINK_STRATEGY",
+    "RustArtifactFiles",
     "RustExportedLinkDeps",
     "RustLinkInfo",
     "RustLinkStrategyInfo",
@@ -697,7 +698,13 @@ def _handle_rust_artifact(
                 children = rust_debug_info,
             )
         return RustLinkStrategyInfo(
-            outputs = {m: x.output for m, x in outputs.items()},
+            outputs = {
+                m: RustArtifactFiles(
+                    artifact = x.output,
+                    spans = x.spans,
+                )
+                for m, x in outputs.items()
+            },
             singleton_tset = {m: x.singleton_tset for m, x in outputs.items()},
             transitive_deps = tdeps,
             transitive_proc_macro_deps = tprocmacrodeps,
@@ -707,7 +714,13 @@ def _handle_rust_artifact(
         # Proc macro deps are always the real thing
         no_transitive_deps = ctx.actions.tset(TransitiveDeps)
         return RustLinkStrategyInfo(
-            outputs = {m: link_output.output for m in MetadataKind},
+            outputs = {
+                m: RustArtifactFiles(
+                    artifact = link_output.output,
+                    spans = link_output.spans,
+                )
+                for m in MetadataKind
+            },
             singleton_tset = {m: link_output.singleton_tset for m in MetadataKind},
             transitive_deps = {m: no_transitive_deps for m in MetadataKind},
             transitive_proc_macro_deps = set(),

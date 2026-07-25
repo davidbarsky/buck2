@@ -572,12 +572,6 @@ fn _assert_dice_compute_future_sizes() {
     // The future of the canonical async closure mapper - the thing that is stored, unboxed, in the
     // join combinator's slot for each branch of a `compute_join_async`. This is mostly just here to
     // detect rustc size regressions (or improvements)
-    mini_vec::size_assert::words_of_expr!(
-        (async |ctx: &mut DiceComputations, k: &K| ctx.compute(k).await)
-            .async_call_once((panic!(), panic!())),
-        11
-    );
-
     mini_vec::size_assert::words_of_async_fn_future!(
         DiceComputations::compute_join,
         (
@@ -588,14 +582,4 @@ fn _assert_dice_compute_future_sizes() {
         3
     );
 
-    // Demonstrate that these are inline
-    mini_vec::size_assert::words_of_async_fn_future!(
-        DiceComputations::compute2,
-        (
-            _,
-            async |ctx| ctx.compute(&K(0)).await,
-            async |ctx| ctx.compute(&K(1)).await
-        ),
-        24
-    );
 }

@@ -103,8 +103,8 @@ rust_toolchain_attrs = {
     # this is only used for linking rlibs into C++/C builds, instead of using
     # staticlibs, but that's expected to change.
     #
-    # FIXME(JakobDegen): This should require `explicit_sysroot_deps` in the
-    # future.
+    # Deferred linking additionally requires either `explicit_sysroot_deps` or
+    # `sysroot_path`, so every archive consumed by the linker is a Buck input.
     "advanced_unstable_linking": provider_field(bool, default = False),
     # Override the implicit sysroot with the provided Artifact containing a directory to
     # a prebuilt sysroot. Will be forwarded to rustc as `--sysroot=<sysroot_path>`. Only
